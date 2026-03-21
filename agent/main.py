@@ -61,7 +61,7 @@ class Agent:
             cafe_id=self.config["cafe_id"],
             api_key=self.config["api_key"],
         )
-        self.job_runner = JobRunner()
+        self.job_runner = JobRunner(model_cache_dir=self.config["model_cache_dir"])
         self.heartbeat_interval = self.config["heartbeat_interval_seconds"]
         self._running = False
         self._job_task = None  # asyncio task for running job
