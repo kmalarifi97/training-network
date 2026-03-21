@@ -16,7 +16,8 @@ class ServerConnection:
         self.agent_id = f"{cafe_id}_{uuid.uuid4().hex[:8]}"
         self._ws = None
         self._connected = False
-        self._reconnect_delay = 5  # seconds
+        self._reconnect_delay = 5
+        self.on_job_received = None  # callback: async def(job_dict)
 
     @property
     def connected(self) -> bool:
@@ -28,7 +29,6 @@ class ServerConnection:
                 logger.info(f"Connecting to server: {self.server_url}")
                 self._ws = await websockets.connect(self.server_url)
 
-                # Send registration
                 await self._ws.send(json.dumps({
                     "type": "register",
                     "agent_id": self.agent_id,
@@ -36,7 +36,6 @@ class ServerConnection:
                     "api_key": self.api_key,
                 }))
 
-                # Wait for registration ack
                 raw = await self._ws.recv()
                 data = json.loads(raw)
 
@@ -68,16 +67,50 @@ class ServerConnection:
             }
             await self._ws.send(json.dumps(msg))
 
-            # Wait for ack
+            # After sending heartbeat, check for response
+            # Server may send heartbeat_ack OR a job assignment
             raw = await self._ws.recv()
             data = json.loads(raw)
-            return data.get("type") == "heartbeat_ack"
+
+            if data.get("type") == "job_assign":
+                logger.info(f"Received job assignment: {data.get('job_id', '')[:8]}")
+                if self.on_job_received:
+                    await self.on_job_received(data)
+            elif data.get("type") == "heartbeat_ack":
+                pass
+
+            return True
 
         except Exception as e:
             logger.warning(f"Heartbeat failed: {e}")
             self._connected = False
             self._ws = None
             return False
+
+    async def send_job_started(self, job_id: str):
+        await self._send({"type": "job_started", "job_id": job_id})
+
+    async def send_job_progress(self, job_id: str, progress: str):
+        await self._send({"type": "job_progress", "job_id": job_id, "progress": progress})
+
+    async def send_job_completed(self, job_id: str, result: str):
+        await self._send({"type": "job_completed", "job_id": job_id, "result": result})
+
+    async def send_job_failed(self, job_id: str, error: str):
+        await self._send({"type": "job_failed", "job_id": job_id, "error": error})
+
+    async def send_job_cancelled(self, job_id: str, reason: str):
+        await self._send({"type": "job_cancelled", "job_id": job_id, "reason": reason})
+
+    async def _send(self, data: dict):
+        if not self.connected:
+            return
+        try:
+            await self._ws.send(json.dumps(data))
+        except Exception as e:
+            logger.warning(f"Send failed: {e}")
+            self._connected = False
+            self._ws = None
 
     async def disconnect(self):
         if self._ws:
