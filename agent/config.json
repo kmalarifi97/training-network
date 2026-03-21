@@ -1,0 +1,12 @@
+{
+  "server_url": "ws://localhost:8000/agents/connect",
+  "cafe_id": "test-cafe-001",
+  "api_key": "",
+  "idle_threshold_minutes": 0.17,
+  "max_gpu_usage_percent": 90,
+  "max_ram_usage_percent": 80,
+  "max_disk_usage_gb": 50,
+  "model_cache_dir": "C:\\GPUNetwork\\models",
+  "log_dir": "C:\\GPUNetwork\\logs",
+  "heartbeat_interval_seconds": 5
+}
