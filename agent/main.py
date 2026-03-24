@@ -11,6 +11,7 @@ from connection import ServerConnection
 from gpu_monitor import GPUMonitor
 from idle_detector import IdleDetector
 from job_runner import JobRunner
+from resource_limiter import ResourceLimiter
 
 
 # --- Logging setup ---
@@ -62,6 +63,7 @@ class Agent:
             api_key=self.config["api_key"],
         )
         self.job_runner = JobRunner(model_cache_dir=self.config["model_cache_dir"])
+        self.resource_limiter = ResourceLimiter(self.config)
         self.heartbeat_interval = self.config["heartbeat_interval_seconds"]
         self._running = False
         self._job_task = None  # asyncio task for running job
@@ -100,6 +102,13 @@ class Agent:
         if self.state != AgentState.AVAILABLE:
             logger.warning(f"Received job but state is {self.state.value}, rejecting")
             await self.connection.send_job_cancelled(job_data["job_id"], "Agent not available")
+            return
+
+        # Pre-job resource check
+        ok, reason = self.resource_limiter.check_pre_job()
+        if not ok:
+            logger.warning(f"Resource check failed: {reason}")
+            await self.connection.send_job_cancelled(job_data["job_id"], f"Resources insufficient: {reason}")
             return
 
         self._set_state(AgentState.WORKING)
