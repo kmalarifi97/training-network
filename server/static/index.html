@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPU Network</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0e17;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #0f1923 0%, #1a1a2e 100%);
+            border-bottom: 1px solid #1e3a5f;
+            padding: 20px 40px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #00d4ff, #0090ff);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            font-weight: bold;
+            color: #fff;
+        }
+        .logo h1 {
+            font-size: 22px;
+            font-weight: 600;
+            background: linear-gradient(135deg, #00d4ff, #0090ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .logo p {
+            font-size: 12px;
+            color: #6b7b8d;
+            margin-top: 2px;
+        }
+        .header-stats {
+            display: flex;
+            gap: 24px;
+        }
+        .header-stat {
+            text-align: center;
+        }
+        .header-stat .value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #00d4ff;
+        }
+        .header-stat .label {
+            font-size: 11px;
+            color: #6b7b8d;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        /* Main layout */
+        .main {
+            display: grid;
+            grid-template-columns: 340px 1fr;
+            gap: 24px;
+            padding: 24px 40px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Panels */
+        .panel {
+            background: #111827;
+            border: 1px solid #1e3a5f;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        .panel-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid #1e3a5f;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .panel-header h2 {
+            font-size: 15px;
+            font-weight: 600;
+            color: #e0e0e0;
+        }
+        .panel-header .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #00d4ff;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+        .panel-body {
+            padding: 20px;
+        }
+
+        /* Agent cards */
+        .agent-card {
+            background: #0d1520;
+            border: 1px solid #1e3a5f;
+            border-radius: 8px;
+            padding: 14px;
+            margin-bottom: 10px;
+        }
+        .agent-card:last-child { margin-bottom: 0; }
+        .agent-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .agent-name {
+            font-size: 13px;
+            font-weight: 600;
+            color: #c0c0c0;
+        }
+        .status-badge {
+            font-size: 11px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .status-AVAILABLE { background: #064e3b; color: #34d399; }
+        .status-WORKING { background: #3b3206; color: #fbbf24; }
+        .status-BUSY { background: #4c1d1d; color: #f87171; }
+        .status-OFFLINE { background: #1f2937; color: #6b7280; }
+        .agent-gpu {
+            font-size: 12px;
+            color: #6b7b8d;
+        }
+        .agent-gpu span { color: #9ca3af; }
+        .vram-bar {
+            height: 4px;
+            background: #1f2937;
+            border-radius: 2px;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+        .vram-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d4ff, #0090ff);
+            border-radius: 2px;
+            transition: width 0.5s ease;
+        }
+        .no-agents {
+            color: #6b7b8d;
+            font-size: 13px;
+            text-align: center;
+            padding: 20px 0;
+        }
+
+        /* Right column */
+        .right-col {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        /* Job form */
+        .form-row {
+            margin-bottom: 16px;
+        }
+        .form-row label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            color: #9ca3af;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        select, textarea {
+            width: 100%;
+            background: #0d1520;
+            border: 1px solid #1e3a5f;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-size: 14px;
+            padding: 10px 14px;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        select:focus, textarea:focus {
+            border-color: #0090ff;
+        }
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+        .submit-btn {
+            width: 100%;
+            padding: 12px;
+            background: linear-gradient(135deg, #0090ff, #00d4ff);
+            border: none;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        .submit-btn:hover { opacity: 0.9; }
+        .submit-btn:active { transform: scale(0.98); }
+        .submit-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        /* Results */
+        .job-card {
+            background: #0d1520;
+            border: 1px solid #1e3a5f;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .job-card:last-child { margin-bottom: 0; }
+        .job-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .job-id {
+            font-size: 12px;
+            font-family: 'Courier New', monospace;
+            color: #6b7b8d;
+        }
+        .job-status {
+            font-size: 11px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .job-PENDING { background: #1f2937; color: #9ca3af; }
+        .job-ASSIGNED { background: #1e3a5f; color: #60a5fa; }
+        .job-RUNNING { background: #3b3206; color: #fbbf24; }
+        .job-COMPLETED { background: #064e3b; color: #34d399; }
+        .job-FAILED { background: #4c1d1d; color: #f87171; }
+        .job-CANCELLED { background: #1f2937; color: #6b7280; }
+        .job-prompt {
+            font-size: 13px;
+            color: #9ca3af;
+            margin-bottom: 8px;
+            font-style: italic;
+        }
+        .job-result {
+            font-size: 14px;
+            color: #e0e0e0;
+            background: #0a0e17;
+            border-radius: 6px;
+            padding: 12px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .job-meta {
+            font-size: 11px;
+            color: #4b5563;
+            margin-top: 8px;
+        }
+        .no-jobs {
+            color: #6b7b8d;
+            font-size: 13px;
+            text-align: center;
+            padding: 20px 0;
+        }
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #fbbf24;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <div class="logo">
+        <div class="logo-icon">G</div>
+        <div>
+            <h1>GPU Network</h1>
+            <p>Distributed AI Inference Platform</p>
+        </div>
+    </div>
+    <div class="header-stats">
+        <div class="header-stat">
+            <div class="value" id="stat-agents">0</div>
+            <div class="label">Agents Online</div>
+        </div>
+        <div class="header-stat">
+            <div class="value" id="stat-jobs">0</div>
+            <div class="label">Total Jobs</div>
+        </div>
+    </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+    <!-- Left: Agents -->
+    <div>
+        <div class="panel">
+            <div class="panel-header">
+                <div class="dot"></div>
+                <h2>Connected Agents</h2>
+            </div>
+            <div class="panel-body" id="agents-list">
+                <div class="no-agents">No agents connected</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right: Submit + Results -->
+    <div class="right-col">
+        <!-- Submit job -->
+        <div class="panel">
+            <div class="panel-header">
+                <h2>Submit Inference Job</h2>
+            </div>
+            <div class="panel-body">
+                <form id="job-form">
+                    <div class="form-row">
+                        <label>Model</label>
+                        <select id="model-select">
+                            <option value="tinyllama-1.1b">TinyLlama 1.1B (fast, lightweight)</option>
+                            <option value="mistral-7b">Mistral 7B (balanced)</option>
+                            <option value="llama3-8b">LLaMA 3 8B (powerful)</option>
+                        </select>
+                    </div>
+                    <div class="form-row">
+                        <label>Prompt</label>
+                        <textarea id="prompt-input" placeholder="Enter your prompt here...">Explain what artificial intelligence is in simple terms.</textarea>
+                    </div>
+                    <button type="submit" class="submit-btn" id="submit-btn">Submit Job</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Results -->
+        <div class="panel">
+            <div class="panel-header">
+                <h2>Job Results</h2>
+            </div>
+            <div class="panel-body" id="jobs-list">
+                <div class="no-jobs">No jobs submitted yet</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const API = window.location.origin;
+    let trackedJobs = [];
+
+    // Poll agents status
+    async function refreshAgents() {
+        try {
+            const res = await fetch(`${API}/agents/status`);
+            const data = await res.json();
+
+            document.getElementById('stat-agents').textContent = data.agents_online;
+
+            const container = document.getElementById('agents-list');
+            const onlineAgents = data.agents.filter(a => a.online);
+
+            if (onlineAgents.length === 0) {
+                container.innerHTML = '<div class="no-agents">Waiting for agents to connect...</div>';
+                return;
+            }
+
+            container.innerHTML = onlineAgents.map(a => {
+                const gpu = a.gpu_info ? (typeof a.gpu_info === 'string' ? JSON.parse(a.gpu_info) : a.gpu_info) : null;
+                const vramPct = gpu ? Math.round((gpu.vram_used_mb / gpu.vram_total_mb) * 100) : 0;
+                return `
+                    <div class="agent-card">
+                        <div class="agent-top">
+                            <div class="agent-name">${a.agent_id.substring(0, 16)}...</div>
+                            <span class="status-badge status-${a.state}">${a.state}</span>
+                        </div>
+                        <div class="agent-gpu">
+                            ${gpu ? `
+                                <span>${gpu.name || 'GPU'}</span><br>
+                                VRAM: ${gpu.vram_used_mb || 0}MB / ${gpu.vram_total_mb || 0}MB
+                                <div class="vram-bar"><div class="vram-bar-fill" style="width:${vramPct}%"></div></div>
+                            ` : 'GPU info unavailable'}
+                        </div>
+                    </div>`;
+            }).join('');
+        } catch (e) {
+            console.error('Failed to fetch agents:', e);
+        }
+    }
+
+    // Poll job statuses
+    async function refreshJobs() {
+        try {
+            const res = await fetch(`${API}/jobs?limit=20`);
+            const data = await res.json();
+
+            document.getElementById('stat-jobs').textContent = data.total;
+
+            const container = document.getElementById('jobs-list');
+            if (data.jobs.length === 0) {
+                container.innerHTML = '<div class="no-jobs">No jobs submitted yet</div>';
+                return;
+            }
+
+            // Show most recent first
+            const jobs = data.jobs.reverse();
+
+            container.innerHTML = jobs.map(j => {
+                const isRunning = j.status === 'RUNNING' || j.status === 'ASSIGNED' || j.status === 'PENDING';
+                return `
+                    <div class="job-card">
+                        <div class="job-top">
+                            <span class="job-id">${j.job_id.substring(0, 12)}...</span>
+                            <span class="job-status job-${j.status}">
+                                ${isRunning ? '<span class="spinner"></span>' : ''}${j.status}
+                            </span>
+                        </div>
+                        <div class="job-prompt">"${escapeHtml(j.prompt?.substring(0, 120) || '')}"</div>
+                        ${j.result ? `<div class="job-result">${escapeHtml(j.result)}</div>` : ''}
+                        ${j.error ? `<div class="job-result" style="color:#f87171">${escapeHtml(j.error)}</div>` : ''}
+                        <div class="job-meta">${j.model_name} &middot; ${j.job_type} &middot; ${formatTime(j.created_at)}</div>
+                    </div>`;
+            }).join('');
+        } catch (e) {
+            console.error('Failed to fetch jobs:', e);
+        }
+    }
+
+    // Submit job
+    document.getElementById('job-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('submit-btn');
+        const model = document.getElementById('model-select').value;
+        const prompt = document.getElementById('prompt-input').value.trim();
+
+        if (!prompt) return;
+
+        btn.disabled = true;
+        btn.textContent = 'Submitting...';
+
+        try {
+            const res = await fetch(`${API}/jobs/submit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_name: model, prompt: prompt, job_type: 'inference' })
+            });
+            const data = await res.json();
+            trackedJobs.push(data.job_id);
+            // Immediately refresh
+            await refreshJobs();
+        } catch (e) {
+            alert('Failed to submit job: ' + e.message);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Submit Job';
+        }
+    });
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    function formatTime(ts) {
+        if (!ts) return '';
+        try {
+            return new Date(ts).toLocaleTimeString();
+        } catch { return ts; }
+    }
+
+    // Start polling
+    refreshAgents();
+    refreshJobs();
+    setInterval(refreshAgents, 3000);
+    setInterval(refreshJobs, 2000);
+</script>
+</body>
+</html>

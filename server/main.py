@@ -1,11 +1,16 @@
 import asyncio
 import hashlib
 import json
+import os
 import secrets
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from database import init_db, create_cafe, get_cafe, get_cafe_by_api_key, list_cafes
@@ -13,6 +18,20 @@ from database import upsert_agent, update_agent_heartbeat, set_agent_offline, li
 from database import create_job, assign_job, update_job_status, get_job, list_jobs, get_pending_jobs
 
 app = FastAPI(title="GPU Network Server")
+
+# CORS — allow all origins for POC
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Static files (web UI)
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # Live WebSocket connections (in-memory — only for active sockets)
 live_connections: dict[str, WebSocket] = {}
@@ -198,6 +217,10 @@ async def agent_connect(websocket: WebSocket):
 # --- REST endpoints ---
 @app.get("/")
 async def root():
+    # Serve web UI if it exists, otherwise return JSON status
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
     return {
         "service": "GPU Network Server",
         "agents_online": len(live_connections),
@@ -267,4 +290,5 @@ async def list_jobs_endpoint(status: str | None = None, limit: int = 100):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
