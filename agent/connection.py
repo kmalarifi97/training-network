@@ -108,8 +108,10 @@ class ServerConnection:
     async def send_job_started(self, job_id: str):
         await self._send({"type": "job_started", "job_id": job_id})
 
-    async def send_job_progress(self, job_id: str, progress: str):
-        await self._send({"type": "job_progress", "job_id": job_id, "progress": progress})
+    async def send_job_progress(self, job_id: str, progress: str, **extra):
+        msg = {"type": "job_progress", "job_id": job_id, "progress": progress}
+        msg.update(extra)
+        await self._send(msg)
 
     async def send_job_completed(self, job_id: str, result: str):
         await self._send({"type": "job_completed", "job_id": job_id, "result": result})

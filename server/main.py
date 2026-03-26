@@ -3,14 +3,12 @@ import hashlib
 import json
 import os
 import secrets
-import sys
-import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header
-from fastapi import UploadFile, File, Form, BackgroundTasks
+from fastapi import UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -20,10 +18,6 @@ from database import init_db, create_cafe, get_cafe, get_cafe_by_api_key, list_c
 from database import upsert_agent, update_agent_heartbeat, set_agent_offline, list_agents, requeue_agent_jobs
 from database import create_job, assign_job, update_job_status, get_job, list_jobs, get_pending_jobs
 from database import create_dataset, update_dataset, get_dataset, list_datasets, delete_dataset
-
-# Add project root to path so dataprep package is importable
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from dataprep import DatasetGenerator, extract_text, chunk_text
 
 app = FastAPI(title="GPU Network Server")
 
@@ -186,20 +180,102 @@ async def agent_connect(websocket: WebSocket):
                 update_job_status(job_id, "RUNNING")
                 print(f"[*] Job {job_id[:8]} started on {agent_id}")
 
+                job = get_job(job_id)
+                if job and job["job_type"] == "dataprep":
+                    try:
+                        prompt_data = json.loads(job["prompt"])
+                        update_dataset(prompt_data["dataset_id"],
+                                       status="PROCESSING",
+                                       started_at=datetime.now().isoformat())
+                    except Exception:
+                        pass
+
             elif data["type"] == "job_progress":
                 job_id = data.get("job_id")
-                update_job_status(job_id, "RUNNING", progress=data.get("progress", ""))
-                print(f"[~] Job {job_id[:8]} progress: {data.get('progress', '')}")
+                progress = data.get("progress", "")
+                update_job_status(job_id, "RUNNING", progress=progress)
+                print(f"[~] Job {job_id[:8]} progress: {progress}")
+
+                # Update linked dataset progress if dataprep
+                job = get_job(job_id)
+                if job and job["job_type"] == "dataprep":
+                    try:
+                        prompt_data = json.loads(job["prompt"])
+                        dataset_id = prompt_data["dataset_id"]
+                        extra = data.get("dataprep_progress", {})
+                        if extra:
+                            update_dataset(dataset_id,
+                                           status="PROCESSING",
+                                           total_chunks=extra.get("total_chunks", 0),
+                                           processed_chunks=extra.get("processed_chunks", 0),
+                                           total_pairs=extra.get("total_pairs", 0))
+                    except Exception:
+                        pass
 
             elif data["type"] == "job_completed":
                 job_id = data.get("job_id")
-                update_job_status(job_id, "COMPLETED", result=data.get("result", ""))
+                result_data = data.get("result", "")
+                update_job_status(job_id, "COMPLETED", result=result_data)
                 print(f"[✓] Job {job_id[:8]} completed by {agent_id}")
+
+                # If this was a dataprep job, save the JSONL and update the dataset
+                job = get_job(job_id)
+                if job and job["job_type"] == "dataprep":
+                    try:
+                        prompt_data = json.loads(job["prompt"])
+                        dataset_id = prompt_data["dataset_id"]
+                        result_obj = json.loads(result_data) if isinstance(result_data, str) else result_data
+                        pairs = result_obj.get("pairs", [])
+                        output_format = prompt_data.get("output_format", "alpaca")
+
+                        output_path = Path(DATAPREP_OUTPUT_DIR) / f"{dataset_id}.jsonl"
+                        with open(output_path, "w", encoding="utf-8") as f:
+                            for pair in pairs:
+                                if output_format == "chat":
+                                    record = {
+                                        "messages": [
+                                            {"role": "user", "content": pair["instruction"]},
+                                            {"role": "assistant", "content": pair["output"]},
+                                        ]
+                                    }
+                                else:
+                                    record = {
+                                        "instruction": pair["instruction"],
+                                        "input": pair.get("input", ""),
+                                        "output": pair["output"],
+                                    }
+                                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                        update_dataset(
+                            dataset_id,
+                            status="COMPLETED",
+                            output_file=str(output_path),
+                            total_pairs=len(pairs),
+                            completed_at=datetime.now().isoformat(),
+                        )
+                        print(f"[dataprep] {dataset_id[:8]}: saved {len(pairs)} pairs")
+                    except Exception as e:
+                        print(f"[dataprep] Failed to save dataset: {e}")
+                        try:
+                            update_dataset(dataset_id, status="FAILED", error=str(e))
+                        except Exception:
+                            pass
 
             elif data["type"] == "job_failed":
                 job_id = data.get("job_id")
-                update_job_status(job_id, "FAILED", error=data.get("error", ""))
-                print(f"[✗] Job {job_id[:8]} failed on {agent_id}: {data.get('error')}")
+                error_msg = data.get("error", "")
+                update_job_status(job_id, "FAILED", error=error_msg)
+                print(f"[✗] Job {job_id[:8]} failed on {agent_id}: {error_msg}")
+
+                # Update linked dataset if this was a dataprep job
+                job = get_job(job_id)
+                if job and job["job_type"] == "dataprep":
+                    try:
+                        prompt_data = json.loads(job["prompt"])
+                        update_dataset(prompt_data["dataset_id"],
+                                       status="FAILED", error=error_msg)
+                    except Exception:
+                        pass
 
             elif data["type"] == "job_cancelled":
                 job_id = data.get("job_id")
@@ -297,42 +373,16 @@ async def list_jobs_endpoint(status: str | None = None, limit: int = 100):
 
 
 # =============================================================================
-# Dataset generation (dataprep integration)
+# Dataset generation — all processing happens on GPU agents
 # =============================================================================
 
-DATAPREP_MODEL_DIR = os.environ.get(
-    "DATAPREP_MODEL_DIR",
-    str(Path(__file__).parent.parent / "models" / "dataprep"),
-)
-DATAPREP_UPLOAD_DIR = os.environ.get(
-    "DATAPREP_UPLOAD_DIR",
-    str(Path(__file__).parent / "uploads"),
-)
 DATAPREP_OUTPUT_DIR = os.environ.get(
     "DATAPREP_OUTPUT_DIR",
     str(Path(__file__).parent / "outputs"),
 )
-DATAPREP_MODEL = os.environ.get("DATAPREP_MODEL", "mistral-7b")
-DATAPREP_CHUNK_SIZE = int(os.environ.get("DATAPREP_CHUNK_SIZE", "500"))
-DATAPREP_CHUNK_OVERLAP = int(os.environ.get("DATAPREP_CHUNK_OVERLAP", "50"))
-DATAPREP_PAIRS_PER_CHUNK = int(os.environ.get("DATAPREP_PAIRS_PER_CHUNK", "3"))
 DATAPREP_MAX_UPLOAD_MB = int(os.environ.get("DATAPREP_MAX_UPLOAD_MB", "50"))
 
-Path(DATAPREP_UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 Path(DATAPREP_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-
-_generator: DatasetGenerator | None = None
-_gen_lock = threading.Lock()
-
-
-def _get_generator() -> DatasetGenerator:
-    global _generator
-    if _generator is None:
-        _generator = DatasetGenerator(
-            model_dir=DATAPREP_MODEL_DIR,
-            model_name=DATAPREP_MODEL,
-        )
-    return _generator
 
 
 class TextInput(BaseModel):
@@ -340,172 +390,121 @@ class TextInput(BaseModel):
     model_name: str | None = None
     strategy: str = "self-instruct"
     output_format: str = "alpaca"
-    chunk_size: int | None = None
-    chunk_overlap: int | None = None
     pairs_per_chunk: int | None = None
-
-
-def _process_dataset(dataset_id: str, source_path: str, model_name: str,
-                     strategy: str, output_format: str,
-                     chunk_size: int, chunk_overlap: int, pairs_per_chunk: int):
-    """Background worker: text -> chunks -> instruction pairs -> JSONL."""
-    with _gen_lock:
-        try:
-            update_dataset(dataset_id, status="PROCESSING",
-                           started_at=datetime.now().isoformat())
-
-            text = extract_text(source_path)
-            if not text.strip():
-                update_dataset(dataset_id, status="FAILED",
-                               error="No text extracted from file")
-                return
-
-            chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
-            if not chunks:
-                update_dataset(dataset_id, status="FAILED",
-                               error="Text too short to generate chunks")
-                return
-
-            update_dataset(dataset_id, total_chunks=len(chunks))
-            print(f"[dataprep] {dataset_id[:8]}: {len(chunks)} chunks from {len(text)} chars")
-
-            gen = _get_generator()
-            if model_name != gen.model_name:
-                gen.unload()
-                gen.model_name = model_name
-
-            all_pairs = []
-            for i, chunk in enumerate(chunks):
-                pairs = gen.generate_pairs(
-                    chunk, strategy=strategy, pairs_per_chunk=pairs_per_chunk,
-                )
-                all_pairs.extend(pairs)
-                update_dataset(dataset_id, processed_chunks=i + 1,
-                               total_pairs=len(all_pairs))
-                print(f"[dataprep] {dataset_id[:8]}: chunk {i+1}/{len(chunks)} "
-                      f"+{len(pairs)} pairs")
-
-            if not all_pairs:
-                update_dataset(dataset_id, status="FAILED",
-                               error="Model produced no usable pairs")
-                return
-
-            output_path = Path(DATAPREP_OUTPUT_DIR) / f"{dataset_id}.jsonl"
-            with open(output_path, "w", encoding="utf-8") as f:
-                for pair in all_pairs:
-                    if output_format == "chat":
-                        record = {
-                            "messages": [
-                                {"role": "user", "content": pair["instruction"]},
-                                {"role": "assistant", "content": pair["output"]},
-                            ]
-                        }
-                    else:
-                        record = {
-                            "instruction": pair["instruction"],
-                            "input": pair.get("input", ""),
-                            "output": pair["output"],
-                        }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-            update_dataset(
-                dataset_id, status="COMPLETED",
-                output_file=str(output_path),
-                total_pairs=len(all_pairs),
-                completed_at=datetime.now().isoformat(),
-            )
-            print(f"[dataprep] {dataset_id[:8]}: done — {len(all_pairs)} pairs")
-
-        except Exception as e:
-            print(f"[dataprep] {dataset_id[:8]}: FAILED — {e}")
-            update_dataset(dataset_id, status="FAILED", error=str(e))
 
 
 @app.post("/datasets/generate/file")
 async def generate_from_file(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    model_name: str = Form(None),
+    model_name: str = Form("mistral-7b"),
     strategy: str = Form("self-instruct"),
     output_format: str = Form("alpaca"),
-    chunk_size: int = Form(None),
-    chunk_overlap: int = Form(None),
-    pairs_per_chunk: int = Form(None),
+    pairs_per_chunk: int = Form(3),
 ):
-    """Upload a file (txt, pdf, docx) and generate a fine-tuning dataset."""
+    """Upload a file and send it to a GPU agent for dataset generation."""
     max_bytes = DATAPREP_MAX_UPLOAD_MB * 1024 * 1024
     content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(400, f"File too large. Max {DATAPREP_MAX_UPLOAD_MB}MB")
 
-    dataset_id = uuid.uuid4().hex
-    upload_path = Path(DATAPREP_UPLOAD_DIR) / f"{dataset_id}_{file.filename}"
-    with open(upload_path, "wb") as f:
-        f.write(content)
+    # Read text from file on server side (lightweight, no model needed)
+    import tempfile
+    suffix = Path(file.filename).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
 
-    source_type = Path(file.filename).suffix.lower().lstrip(".")
+    try:
+        # Extract text — only import needed: PyPDF2/python-docx for PDF/DOCX
+        if suffix.lower() == ".pdf":
+            try:
+                import PyPDF2
+                parts = []
+                with open(tmp_path, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page in reader.pages:
+                        t = page.extract_text()
+                        if t:
+                            parts.append(t)
+                text = "\n\n".join(parts)
+            except ImportError:
+                raise HTTPException(500, "PyPDF2 not installed on server")
+        elif suffix.lower() in (".docx", ".doc"):
+            try:
+                import docx
+                doc = docx.Document(tmp_path)
+                text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            except ImportError:
+                raise HTTPException(500, "python-docx not installed on server")
+        else:
+            text = content.decode("utf-8", errors="replace")
+    finally:
+        os.unlink(tmp_path)
 
-    create_dataset(
-        dataset_id=dataset_id,
+    if not text.strip():
+        raise HTTPException(400, "No text could be extracted from file")
+
+    return await _create_dataprep_job(
+        text=text,
         source_filename=file.filename,
-        source_type=source_type,
-        model_name=model_name or DATAPREP_MODEL,
+        model_name=model_name,
         strategy=strategy,
         output_format=output_format,
-        chunk_size=chunk_size or DATAPREP_CHUNK_SIZE,
-        pairs_per_chunk=pairs_per_chunk or DATAPREP_PAIRS_PER_CHUNK,
+        pairs_per_chunk=pairs_per_chunk,
     )
-
-    background_tasks.add_task(
-        _process_dataset,
-        dataset_id=dataset_id,
-        source_path=str(upload_path),
-        model_name=model_name or DATAPREP_MODEL,
-        strategy=strategy,
-        output_format=output_format,
-        chunk_size=chunk_size or DATAPREP_CHUNK_SIZE,
-        chunk_overlap=chunk_overlap or DATAPREP_CHUNK_OVERLAP,
-        pairs_per_chunk=pairs_per_chunk or DATAPREP_PAIRS_PER_CHUNK,
-    )
-
-    return {"dataset_id": dataset_id, "status": "PENDING"}
 
 
 @app.post("/datasets/generate/text")
-async def generate_from_text(req: TextInput, background_tasks: BackgroundTasks):
-    """Submit raw text and generate a fine-tuning dataset."""
+async def generate_from_text(req: TextInput):
+    """Submit raw text — sent to a GPU agent for dataset generation."""
     if not req.text.strip():
         raise HTTPException(400, "Text cannot be empty")
 
+    return await _create_dataprep_job(
+        text=req.text,
+        source_filename="raw_text",
+        model_name=req.model_name or "mistral-7b",
+        strategy=req.strategy,
+        output_format=req.output_format,
+        pairs_per_chunk=req.pairs_per_chunk or 3,
+    )
+
+
+async def _create_dataprep_job(text: str, source_filename: str, model_name: str,
+                                strategy: str, output_format: str,
+                                pairs_per_chunk: int) -> dict:
+    """Create a dataset record + a dataprep job, assign to GPU agent."""
     dataset_id = uuid.uuid4().hex
-    upload_path = Path(DATAPREP_UPLOAD_DIR) / f"{dataset_id}_raw.txt"
-    with open(upload_path, "w", encoding="utf-8") as f:
-        f.write(req.text)
+    job_id = uuid.uuid4().hex
 
     create_dataset(
         dataset_id=dataset_id,
-        source_filename="raw_text",
-        source_type="txt",
-        model_name=req.model_name or DATAPREP_MODEL,
-        strategy=req.strategy,
-        output_format=req.output_format,
-        chunk_size=req.chunk_size or DATAPREP_CHUNK_SIZE,
-        pairs_per_chunk=req.pairs_per_chunk or DATAPREP_PAIRS_PER_CHUNK,
+        source_filename=source_filename,
+        source_type=Path(source_filename).suffix.lower().lstrip(".") or "txt",
+        model_name=model_name,
+        strategy=strategy,
+        output_format=output_format,
+        chunk_size=0,
+        pairs_per_chunk=pairs_per_chunk,
     )
 
-    background_tasks.add_task(
-        _process_dataset,
-        dataset_id=dataset_id,
-        source_path=str(upload_path),
-        model_name=req.model_name or DATAPREP_MODEL,
-        strategy=req.strategy,
-        output_format=req.output_format,
-        chunk_size=req.chunk_size or DATAPREP_CHUNK_SIZE,
-        chunk_overlap=req.chunk_overlap or DATAPREP_CHUNK_OVERLAP,
-        pairs_per_chunk=req.pairs_per_chunk or DATAPREP_PAIRS_PER_CHUNK,
-    )
+    # The prompt field carries all the data the agent needs
+    job_prompt = json.dumps({
+        "text": text,
+        "dataset_id": dataset_id,
+        "strategy": strategy,
+        "output_format": output_format,
+        "pairs_per_chunk": pairs_per_chunk,
+    })
 
-    return {"dataset_id": dataset_id, "status": "PENDING"}
+    create_job(job_id, "dataprep", model_name, job_prompt)
+    update_dataset(dataset_id, status="PENDING")
+
+    print(f"[dataprep] {dataset_id[:8]}: job {job_id[:8]} queued ({len(text)} chars)")
+
+    await try_assign_jobs()
+
+    return {"dataset_id": dataset_id, "job_id": job_id, "status": "PENDING"}
 
 
 @app.get("/datasets")
@@ -540,7 +539,6 @@ async def download_dataset(dataset_id: str):
 
 @app.get("/datasets/{dataset_id}/preview")
 async def preview_dataset(dataset_id: str, lines: int = 5):
-    """Preview the first N lines of a completed dataset."""
     ds = get_dataset(dataset_id)
     if not ds:
         raise HTTPException(404, "Dataset not found")
@@ -564,8 +562,6 @@ async def remove_dataset(dataset_id: str):
         raise HTTPException(404, "Dataset not found")
     if ds["output_file"]:
         Path(ds["output_file"]).unlink(missing_ok=True)
-    for f in Path(DATAPREP_UPLOAD_DIR).glob(f"{dataset_id}_*"):
-        f.unlink(missing_ok=True)
     delete_dataset(dataset_id)
     return {"message": "Dataset deleted"}
 

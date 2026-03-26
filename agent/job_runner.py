@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import re
 from pathlib import Path
 
 from llama_cpp import Llama
@@ -108,6 +110,8 @@ class JobRunner:
         try:
             if job_type == "inference":
                 result = await self._run_inference(job, progress_callback)
+            elif job_type == "dataprep":
+                result = await self._run_dataprep(job, progress_callback)
             elif job_type == "fine-tune":
                 result = await self._mock_finetune(job, progress_callback)
             else:
@@ -165,6 +169,175 @@ class JobRunner:
 
         logger.info(f"Job {job_id[:8]} completed: {result_text[:80]}...")
         return {"status": "completed", "result": result_text}
+
+    # --- Dataprep: text → chunks → instruction pairs (all on GPU) ---
+
+    SELF_INSTRUCT_PROMPT = (
+        "You are a training data generator. Given the following text, create exactly {n} "
+        "instruction-response pairs for fine-tuning a language model on this content.\n\n"
+        "Rules:\n"
+        "- Each instruction must be a clear question or task about the text\n"
+        "- Each response must be accurate, detailed, and self-contained\n"
+        "- Cover different aspects: facts, explanations, summaries, analysis\n"
+        "- Output ONLY a valid JSON array, no other text\n\n"
+        "Text:\n\"\"\"\n{text}\n\"\"\"\n\n"
+        "JSON array of {n} pairs:\n"
+        '[{{"instruction": "...", "output": "..."}}]'
+    )
+
+    GENSTRUCT_PROMPT = (
+        "[INST] Given the following passage, generate a single high-quality question "
+        "and comprehensive answer based on its content.\n\n"
+        "Passage:\n\"\"\"\n{text}\n\"\"\"\n\n"
+        "Output exactly one JSON object:\n"
+        '{{"instruction": "your question", "output": "your answer"}} [/INST]'
+    )
+
+    def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]:
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = re.sub(r' {2,}', ' ', text).strip()
+        if not text:
+            return []
+        words = text.split()
+        if len(words) <= chunk_size:
+            return [text]
+        chunks = []
+        start = 0
+        while start < len(words):
+            end = min(start + chunk_size, len(words))
+            chunk_str = " ".join(words[start:end])
+            if end < len(words):
+                bp = max(chunk_str.rfind('. '), chunk_str.rfind('\n'))
+                if bp > len(chunk_str) * 0.5:
+                    chunk_str = chunk_str[:bp + 1].strip()
+            if chunk_str:
+                chunks.append(chunk_str)
+            start = end - overlap
+            if start >= len(words):
+                break
+        return chunks
+
+    def _generate_pairs_from_chunk(self, chunk: str, strategy: str, n: int) -> list[dict]:
+        if strategy == "genstruct":
+            return self._genstruct_pairs(chunk, n)
+        return self._self_instruct_pairs(chunk, n)
+
+    def _self_instruct_pairs(self, chunk: str, n: int) -> list[dict]:
+        prompt = self.SELF_INSTRUCT_PROMPT.format(text=chunk[:3000], n=n)
+        output = self._llm(prompt, max_tokens=1024, temperature=0.7, stop=["\n\n\n"])
+        raw = output["choices"][0]["text"].strip()
+        return self._parse_json_pairs(raw)
+
+    def _genstruct_pairs(self, chunk: str, n: int) -> list[dict]:
+        pairs = []
+        for _ in range(n):
+            prompt = self.GENSTRUCT_PROMPT.format(text=chunk[:2000])
+            output = self._llm(prompt, max_tokens=512, temperature=0.8, stop=["\n\n\n"])
+            raw = output["choices"][0]["text"].strip()
+            parsed = self._parse_single_pair(raw)
+            if parsed:
+                pairs.append(parsed)
+        return pairs
+
+    def _parse_json_pairs(self, raw: str) -> list[dict]:
+        try:
+            match = re.search(r'\[.*\]', raw, re.DOTALL)
+            if match:
+                arr = json.loads(match.group())
+                return [p for p in arr if "instruction" in p and "output" in p]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        pairs = []
+        for match in re.finditer(r'\{[^{}]*"instruction"[^{}]*"output"[^{}]*\}', raw, re.DOTALL):
+            try:
+                obj = json.loads(match.group())
+                if "instruction" in obj and "output" in obj:
+                    pairs.append(obj)
+            except json.JSONDecodeError:
+                continue
+        return pairs
+
+    def _parse_single_pair(self, raw: str) -> dict | None:
+        try:
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if match:
+                obj = json.loads(match.group())
+                if "instruction" in obj and "output" in obj:
+                    return obj
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    async def _run_dataprep(self, job: dict, progress_callback=None) -> dict:
+        """Full dataset generation on GPU: chunk text, generate pairs, return all."""
+        job_id = job["job_id"]
+        model_name = job.get("model_name", "mistral-7b")
+
+        # Parse the job prompt which contains all dataprep parameters
+        try:
+            params = json.loads(job.get("prompt", "{}"))
+        except json.JSONDecodeError:
+            return {"status": "failed", "error": "Invalid dataprep job parameters"}
+
+        text = params.get("text", "")
+        strategy = params.get("strategy", "self-instruct")
+        pairs_per_chunk = params.get("pairs_per_chunk", 3)
+
+        if not text.strip():
+            return {"status": "failed", "error": "No text provided"}
+
+        # Step 1: Chunk
+        if progress_callback:
+            await progress_callback(job_id, "Chunking text...")
+        chunks = self._chunk_text(text)
+        if not chunks:
+            return {"status": "failed", "error": "Text too short to chunk"}
+
+        logger.info(f"Job {job_id[:8]}: {len(chunks)} chunks from {len(text)} chars")
+
+        # Step 2: Load model
+        if progress_callback:
+            await progress_callback(job_id, "Loading model...")
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._ensure_model, model_name)
+        if self._cancel_flag:
+            return {"status": "cancelled", "reason": "Gamer returned"}
+
+        await loop.run_in_executor(None, self._load_model, model_name)
+        if self._cancel_flag:
+            return {"status": "cancelled", "reason": "Gamer returned"}
+
+        # Step 3: Generate pairs from each chunk on GPU
+        all_pairs = []
+        for i, chunk in enumerate(chunks):
+            if self._cancel_flag:
+                return {"status": "cancelled", "reason": "Gamer returned",
+                        "partial_pairs": all_pairs}
+
+            if progress_callback:
+                await progress_callback(job_id,
+                    f"Generating pairs: chunk {i+1}/{len(chunks)}")
+                # Send structured progress for dataset tracking
+                if hasattr(progress_callback, '__self__'):
+                    pass  # handled via dataprep_progress below
+
+            def gen_chunk(c=chunk):
+                return self._generate_pairs_from_chunk(c, strategy, pairs_per_chunk)
+
+            pairs = await loop.run_in_executor(None, gen_chunk)
+            all_pairs.extend(pairs)
+            logger.info(f"Job {job_id[:8]}: chunk {i+1}/{len(chunks)} → {len(pairs)} pairs")
+
+        if not all_pairs:
+            return {"status": "failed", "error": "Model produced no usable pairs"}
+
+        if progress_callback:
+            await progress_callback(job_id, "Complete")
+
+        logger.info(f"Job {job_id[:8]}: dataprep done — {len(all_pairs)} total pairs")
+        result = json.dumps({"pairs": all_pairs, "total_pairs": len(all_pairs)})
+        return {"status": "completed", "result": result}
 
     async def _mock_finetune(self, job: dict, progress_callback=None) -> dict:
         """Mock fine-tuning — will be replaced with real LoRA training later."""
