@@ -82,6 +82,28 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
             CREATE INDEX IF NOT EXISTS idx_jobs_assigned ON jobs(assigned_to);
             CREATE INDEX IF NOT EXISTS idx_agents_cafe ON agents(cafe_id);
+
+            CREATE TABLE IF NOT EXISTS datasets (
+                dataset_id TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'PENDING',
+                source_filename TEXT,
+                source_type TEXT,
+                model_name TEXT,
+                strategy TEXT DEFAULT 'self-instruct',
+                output_format TEXT DEFAULT 'alpaca',
+                chunk_size INTEGER,
+                pairs_per_chunk INTEGER,
+                total_chunks INTEGER DEFAULT 0,
+                processed_chunks INTEGER DEFAULT 0,
+                total_pairs INTEGER DEFAULT 0,
+                output_file TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_datasets_status ON datasets(status);
         """)
 
 
@@ -261,3 +283,55 @@ def requeue_agent_jobs(agent_id: str):
             UPDATE jobs SET status = 'PENDING', assigned_to = NULL
             WHERE assigned_to = ? AND status IN ('ASSIGNED', 'RUNNING')
         """, (agent_id,))
+
+
+# --- Dataset operations ---
+
+def create_dataset(dataset_id: str, source_filename: str, source_type: str,
+                   model_name: str, strategy: str, output_format: str,
+                   chunk_size: int, pairs_per_chunk: int) -> dict:
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO datasets (dataset_id, source_filename, source_type, model_name,
+                                  strategy, output_format, chunk_size, pairs_per_chunk, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (dataset_id, source_filename, source_type, model_name,
+              strategy, output_format, chunk_size, pairs_per_chunk, now))
+    return {"dataset_id": dataset_id, "status": "PENDING", "created_at": now}
+
+
+def update_dataset(dataset_id: str, **kwargs):
+    sets = []
+    vals = []
+    for key, val in kwargs.items():
+        sets.append(f"{key} = ?")
+        vals.append(val)
+    vals.append(dataset_id)
+    with get_db() as conn:
+        conn.execute(f"UPDATE datasets SET {', '.join(sets)} WHERE dataset_id = ?", vals)
+
+
+def get_dataset(dataset_id: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM datasets WHERE dataset_id = ?", (dataset_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_datasets(status: str | None = None, limit: int = 100) -> list[dict]:
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM datasets WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM datasets ORDER BY created_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_dataset(dataset_id: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
