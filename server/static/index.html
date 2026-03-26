@@ -563,8 +563,9 @@
                 </div>
             </div>
             <div class="panel">
-                <div class="panel-header">
+                <div class="panel-header" style="justify-content:space-between">
                     <h2>Job Results</h2>
+                    <button onclick="clearAllJobs()" style="padding:4px 12px;font-size:11px;font-weight:600;background:#4c1d1d;color:#f87171;border:1px solid #7f1d1d;border-radius:6px;cursor:pointer">Clear All</button>
                 </div>
                 <div class="panel-body" id="jobs-list">
                     <div class="no-jobs">No jobs submitted yet</div>
@@ -736,7 +737,10 @@
                         <div class="job-prompt">"${escapeHtml(j.prompt?.substring(0, 120) || '')}"</div>
                         ${j.result ? `<div class="job-result">${escapeHtml(j.result)}</div>` : ''}
                         ${j.error ? `<div class="job-result" style="color:#f87171">${escapeHtml(j.error)}</div>` : ''}
-                        <div class="job-meta">${j.model_name} &middot; ${j.job_type} &middot; ${formatTime(j.submitted_at)}</div>
+                        <div class="job-meta" style="display:flex;justify-content:space-between;align-items:center">
+                            <span>${j.model_name} &middot; ${j.job_type} &middot; ${formatTime(j.submitted_at)}</span>
+                            <button onclick="deleteJob('${j.job_id}')" style="padding:2px 8px;font-size:10px;background:none;color:#6b7280;border:1px solid #1e3a5f;border-radius:4px;cursor:pointer">delete</button>
+                        </div>
                     </div>`;
             }).join('');
         } catch (e) {
@@ -998,6 +1002,25 @@
     // =========================================================================
     // Helpers
     // =========================================================================
+    async function deleteJob(id) {
+        try {
+            await fetch(`${API}/jobs/${id}`, { method: 'DELETE' });
+            await refreshJobs();
+        } catch (e) {
+            alert('Failed to delete job: ' + e.message);
+        }
+    }
+
+    async function clearAllJobs() {
+        if (!confirm('Delete all jobs?')) return;
+        try {
+            await fetch(`${API}/jobs`, { method: 'DELETE' });
+            await refreshJobs();
+        } catch (e) {
+            alert('Failed: ' + e.message);
+        }
+    }
+
     function escapeHtml(text) {
         const div = document.createElement('div');
         div.textContent = text;

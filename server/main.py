@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from database import init_db, create_cafe, get_cafe, get_cafe_by_api_key, list_cafes
 from database import upsert_agent, update_agent_heartbeat, set_agent_offline, list_agents, requeue_agent_jobs
-from database import create_job, assign_job, update_job_status, get_job, list_jobs, get_pending_jobs
+from database import create_job, assign_job, update_job_status, get_job, list_jobs, get_pending_jobs, delete_job, delete_all_jobs
 from database import create_dataset, update_dataset, get_dataset, list_datasets, delete_dataset
 
 app = FastAPI(title="GPU Network Server")
@@ -370,6 +370,21 @@ async def list_jobs_endpoint(status: str | None = None, limit: int = 100):
     for j in jobs:
         j.pop("assigned_to", None)
     return {"total": len(jobs), "jobs": jobs}
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job_endpoint(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    delete_job(job_id)
+    return {"message": "Job deleted"}
+
+
+@app.delete("/jobs")
+async def delete_all_jobs_endpoint():
+    delete_all_jobs()
+    return {"message": "All jobs deleted"}
 
 
 # =============================================================================

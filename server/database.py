@@ -276,6 +276,16 @@ def get_pending_jobs() -> list[dict]:
     return list_jobs(status="PENDING")
 
 
+def delete_job(job_id: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+
+
+def delete_all_jobs():
+    with get_db() as conn:
+        conn.execute("DELETE FROM jobs")
+
+
 def requeue_agent_jobs(agent_id: str):
     """Return all in-flight jobs for an agent back to PENDING."""
     with get_db() as conn:
