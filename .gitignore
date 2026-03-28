@@ -3,3 +3,33 @@ __pycache__/
 *.pyc
 *.log
 C:/GPUNetwork/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Build artifacts
+dist/
+build/_pyinstaller/
+installer_output/
+*.exe
+*.spec
+
+# Dataprep output
+server/dataprep_output/
+server/uploads/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+
+# Deployment docs (internal only)
+DEPLOYMENT.md
