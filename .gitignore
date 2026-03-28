@@ -19,6 +19,11 @@ installer_output/
 # Dataprep output
 server/dataprep_output/
 server/uploads/
+server/outputs/
+
+# Fine-tuning data
+server/finetune_uploads/
+server/finetune_adapters/
 
 # OS files
 .DS_Store

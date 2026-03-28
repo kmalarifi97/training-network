@@ -490,6 +490,117 @@
             grid-template-columns: 1fr 1fr;
             gap: 24px;
         }
+
+        /* Fine-tune run cards */
+        .ft-card {
+            background: #0d1520;
+            border: 1px solid #1e3a5f;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 12px;
+        }
+        .ft-card:last-child { margin-bottom: 0; }
+        .ft-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .ft-id {
+            font-size: 12px;
+            font-family: 'Courier New', monospace;
+            color: #6b7b8d;
+        }
+        .ft-status {
+            font-size: 11px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .ft-PENDING { background: #1f2937; color: #9ca3af; }
+        .ft-TRAINING { background: #3b3206; color: #fbbf24; }
+        .ft-COMPLETED { background: #064e3b; color: #34d399; }
+        .ft-FAILED { background: #4c1d1d; color: #f87171; }
+        .ft-meta {
+            font-size: 11px;
+            color: #4b5563;
+            margin-top: 8px;
+        }
+        .ft-progress {
+            margin-top: 10px;
+        }
+        .ft-progress-bar {
+            height: 6px;
+            background: #1f2937;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .ft-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #f59e0b, #ef4444);
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+        .ft-progress-text {
+            font-size: 11px;
+            color: #6b7b8d;
+            margin-top: 4px;
+        }
+        .ft-loss {
+            font-size: 20px;
+            font-weight: 700;
+            color: #fbbf24;
+            margin-top: 6px;
+        }
+        .ft-actions {
+            margin-top: 10px;
+            display: flex;
+            gap: 8px;
+        }
+        .ft-actions button {
+            padding: 6px 14px;
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid #1e3a5f;
+            border-radius: 6px;
+            cursor: pointer;
+            background: #0d1520;
+            color: #9ca3af;
+            transition: all 0.2s;
+        }
+        .ft-actions button:hover {
+            border-color: #0090ff;
+            color: #e0e0e0;
+        }
+        .ft-actions .btn-download {
+            border-color: #064e3b;
+            color: #34d399;
+        }
+        .ft-actions .btn-download:hover {
+            background: #064e3b;
+            color: #fff;
+        }
+        .no-finetunes {
+            color: #6b7b8d;
+            font-size: 13px;
+            text-align: center;
+            padding: 20px 0;
+        }
+        .ft-config {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 6px;
+            margin-top: 8px;
+        }
+        .ft-config-item {
+            font-size: 11px;
+            color: #6b7b8d;
+        }
+        .ft-config-item span {
+            color: #9ca3af;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -516,6 +627,10 @@
             <div class="value" id="stat-datasets">0</div>
             <div class="label">Datasets</div>
         </div>
+        <div class="header-stat">
+            <div class="value" id="stat-finetune">0</div>
+            <div class="label">Fine-Tunes</div>
+        </div>
     </div>
 </div>
 
@@ -523,6 +638,7 @@
 <div class="tab-bar">
     <button class="tab-btn active" data-tab="inference">Inference</button>
     <button class="tab-btn" data-tab="dataprep">Dataset Generator</button>
+    <button class="tab-btn" data-tab="finetune">Fine-Tuning</button>
 </div>
 
 <!-- Tab 1: Inference (existing) -->
@@ -645,6 +761,88 @@
                     </div>
                     <div class="panel-body" id="datasets-list">
                         <div class="no-datasets">No datasets generated yet</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Tab 3: Fine-Tuning -->
+<div class="tab-content" id="tab-finetune">
+    <div class="tab-main">
+        <div class="ds-layout">
+            <!-- Left: Upload + config -->
+            <div>
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Start Fine-Tuning</h2>
+                    </div>
+                    <div class="panel-body">
+                        <form id="ft-form">
+                            <div class="form-row">
+                                <label>Training Data (.jsonl)</label>
+                                <div class="drop-zone" id="ft-drop-zone">
+                                    <input type="file" id="ft-file" accept=".jsonl">
+                                    <div class="drop-zone-text" id="ft-drop-text">
+                                        <strong>Click to browse</strong> or drag and drop<br>
+                                    </div>
+                                    <div class="drop-zone-hint">Alpaca JSONL — instruction/input/output</div>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <label>Base Model</label>
+                                <select id="ft-model">
+                                    <option value="tinyllama-1.1b">TinyLlama 1.1B (fits 6GB VRAM)</option>
+                                    <option value="mistral-7b">Mistral 7B (needs 12GB+ VRAM)</option>
+                                    <option value="llama3-8b">LLaMA 3 8B (needs 16GB+ VRAM)</option>
+                                </select>
+                            </div>
+                            <div class="form-row-inline">
+                                <div class="form-row">
+                                    <label>Epochs</label>
+                                    <input type="number" id="ft-epochs" value="3" min="1" max="50">
+                                </div>
+                                <div class="form-row">
+                                    <label>Batch Size</label>
+                                    <input type="number" id="ft-batch" value="4" min="1" max="32">
+                                </div>
+                            </div>
+                            <div class="form-row-inline">
+                                <div class="form-row">
+                                    <label>Learning Rate</label>
+                                    <input type="number" id="ft-lr" value="0.0002" step="0.0001" min="0.00001" max="0.01">
+                                </div>
+                                <div class="form-row">
+                                    <label>Max Steps (-1 = auto)</label>
+                                    <input type="number" id="ft-maxsteps" value="-1" min="-1">
+                                </div>
+                            </div>
+                            <div class="form-row-inline">
+                                <div class="form-row">
+                                    <label>LoRA Rank (r)</label>
+                                    <input type="number" id="ft-lora-r" value="16" min="4" max="128">
+                                </div>
+                                <div class="form-row">
+                                    <label>LoRA Alpha</label>
+                                    <input type="number" id="ft-lora-alpha" value="32" min="4" max="256">
+                                </div>
+                            </div>
+                            <button type="submit" class="submit-btn" id="ft-submit-btn">Start Fine-Tuning</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right: Run list -->
+            <div>
+                <div class="panel">
+                    <div class="panel-header">
+                        <div class="dot"></div>
+                        <h2>Fine-Tune Runs</h2>
+                    </div>
+                    <div class="panel-body" id="finetune-list">
+                        <div class="no-finetunes">No fine-tune runs yet</div>
                     </div>
                 </div>
             </div>
@@ -1000,6 +1198,170 @@
     });
 
     // =========================================================================
+    // Fine-Tuning tab
+    // =========================================================================
+    let ftSelectedFile = null;
+
+    const ftDropZone = document.getElementById('ft-drop-zone');
+    const ftFileInput = document.getElementById('ft-file');
+    const ftDropText = document.getElementById('ft-drop-text');
+
+    ftDropZone.addEventListener('click', () => ftFileInput.click());
+    ftDropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        ftDropZone.classList.add('dragover');
+    });
+    ftDropZone.addEventListener('dragleave', () => ftDropZone.classList.remove('dragover'));
+    ftDropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        ftDropZone.classList.remove('dragover');
+        if (e.dataTransfer.files.length > 0) ftSelectFile(e.dataTransfer.files[0]);
+    });
+    ftFileInput.addEventListener('change', () => {
+        if (ftFileInput.files.length > 0) ftSelectFile(ftFileInput.files[0]);
+    });
+
+    function ftSelectFile(file) {
+        ftSelectedFile = file;
+        ftDropZone.classList.add('has-file');
+        const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+        ftDropText.innerHTML = `<span class="drop-zone-file">${escapeHtml(file.name)}</span><br>
+            <span class="drop-zone-hint">${sizeMB} MB — click to change</span>`;
+    }
+
+    // Submit fine-tune
+    document.getElementById('ft-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = document.getElementById('ft-submit-btn');
+        if (!ftSelectedFile) {
+            alert('Upload a .jsonl training data file.');
+            return;
+        }
+        btn.disabled = true;
+        btn.textContent = 'Submitting...';
+        try {
+            const form = new FormData();
+            form.append('file', ftSelectedFile);
+            form.append('base_model', document.getElementById('ft-model').value);
+            form.append('epochs', document.getElementById('ft-epochs').value);
+            form.append('batch_size', document.getElementById('ft-batch').value);
+            form.append('learning_rate', document.getElementById('ft-lr').value);
+            form.append('lora_r', document.getElementById('ft-lora-r').value);
+            form.append('lora_alpha', document.getElementById('ft-lora-alpha').value);
+            form.append('max_steps', document.getElementById('ft-maxsteps').value);
+
+            const res = await fetch(`${API}/finetune/upload`, { method: 'POST', body: form });
+            if (!res.ok) {
+                const err = await res.json();
+                throw new Error(err.detail || 'Server error');
+            }
+            await refreshFinetune();
+
+            // Reset
+            ftSelectedFile = null;
+            ftFileInput.value = '';
+            ftDropZone.classList.remove('has-file');
+            ftDropText.innerHTML = '<strong>Click to browse</strong> or drag and drop<br>';
+        } catch (e) {
+            alert('Failed: ' + e.message);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Start Fine-Tuning';
+        }
+    });
+
+    // Poll fine-tune runs
+    async function refreshFinetune() {
+        try {
+            const res = await fetch(`${API}/finetune?limit=20`);
+            const data = await res.json();
+            document.getElementById('stat-finetune').textContent = data.total;
+            const container = document.getElementById('finetune-list');
+
+            if (data.runs.length === 0) {
+                container.innerHTML = '<div class="no-finetunes">No fine-tune runs yet</div>';
+                return;
+            }
+
+            container.innerHTML = data.runs.map(ft => {
+                const isActive = ft.status === 'PENDING' || ft.status === 'TRAINING';
+                const progress = ft.total_steps > 0
+                    ? Math.round((ft.current_step / ft.total_steps) * 100)
+                    : 0;
+
+                return `
+                    <div class="ft-card">
+                        <div class="ft-top">
+                            <span class="ft-id">${ft.run_id.substring(0, 12)}...</span>
+                            <span class="ft-status ft-${ft.status}">
+                                ${isActive ? '<span class="spinner"></span>' : ''}${ft.status}
+                            </span>
+                        </div>
+                        <div class="ft-meta">
+                            ${ft.base_model} &middot; ${formatTime(ft.created_at)}
+                        </div>
+                        <div class="ft-config">
+                            <div class="ft-config-item">Epochs: <span>${ft.epochs}</span></div>
+                            <div class="ft-config-item">Batch: <span>${ft.batch_size}</span></div>
+                            <div class="ft-config-item">LR: <span>${ft.learning_rate}</span></div>
+                            <div class="ft-config-item">LoRA r: <span>${ft.lora_r}</span></div>
+                            <div class="ft-config-item">Alpha: <span>${ft.lora_alpha}</span></div>
+                            <div class="ft-config-item">Steps: <span>${ft.max_steps === -1 ? 'auto' : ft.max_steps}</span></div>
+                        </div>
+                        ${isActive ? `
+                            <div class="ft-progress">
+                                <div class="ft-progress-bar">
+                                    <div class="ft-progress-fill" style="width:${progress}%"></div>
+                                </div>
+                                <div class="ft-progress-text">
+                                    Step ${ft.current_step}/${ft.total_steps}
+                                    ${ft.current_loss ? ` &middot; Loss: ${ft.current_loss.toFixed(4)}` : ''}
+                                    ${ft.current_epoch ? ` &middot; Epoch ${ft.current_epoch.toFixed(1)}` : ''}
+                                </div>
+                            </div>
+                        ` : ''}
+                        ${ft.status === 'COMPLETED' ? `
+                            <div class="ft-loss">
+                                Final Loss: ${ft.current_loss ? ft.current_loss.toFixed(4) : 'N/A'}
+                            </div>
+                            <div class="ft-meta" style="color:#34d399">
+                                ${ft.current_step} steps completed
+                            </div>
+                            <div class="ft-actions">
+                                <button class="btn-download" onclick="downloadAdapter('${ft.run_id}')">Download Adapter</button>
+                                <button onclick="deleteFinetune('${ft.run_id}')">Delete</button>
+                            </div>
+                        ` : ''}
+                        ${ft.status === 'FAILED' ? `
+                            <div class="ft-meta" style="color:#f87171; margin-top:6px">
+                                ${escapeHtml(ft.error || 'Unknown error')}
+                            </div>
+                            <div class="ft-actions">
+                                <button onclick="deleteFinetune('${ft.run_id}')">Delete</button>
+                            </div>
+                        ` : ''}
+                    </div>`;
+            }).join('');
+        } catch (e) {
+            console.error('Failed to fetch fine-tune runs:', e);
+        }
+    }
+
+    function downloadAdapter(id) {
+        window.open(`${API}/finetune/${id}/download`, '_blank');
+    }
+
+    async function deleteFinetune(id) {
+        if (!confirm('Delete this fine-tune run?')) return;
+        try {
+            await fetch(`${API}/finetune/${id}`, { method: 'DELETE' });
+            await refreshFinetune();
+        } catch (e) {
+            alert('Failed to delete: ' + e.message);
+        }
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
     async function deleteJob(id) {
@@ -1039,9 +1401,11 @@
     refreshAgents();
     refreshJobs();
     refreshDatasets();
+    refreshFinetune();
     setInterval(refreshAgents, 3000);
     setInterval(refreshJobs, 2000);
     setInterval(refreshDatasets, 3000);
+    setInterval(refreshFinetune, 2000);
 </script>
 </body>
 </html>

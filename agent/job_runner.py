@@ -113,7 +113,7 @@ class JobRunner:
             elif job_type == "dataprep":
                 result = await self._run_dataprep(job, progress_callback)
             elif job_type == "fine-tune":
-                result = await self._mock_finetune(job, progress_callback)
+                result = await self._run_finetune(job, progress_callback)
             else:
                 result = {"status": "failed", "error": f"Unknown job type: {job_type}"}
         except asyncio.CancelledError:
@@ -339,20 +339,302 @@ class JobRunner:
         result = json.dumps({"pairs": all_pairs, "total_pairs": len(all_pairs)})
         return {"status": "completed", "result": result}
 
-    async def _mock_finetune(self, job: dict, progress_callback=None) -> dict:
-        """Mock fine-tuning — will be replaced with real LoRA training later."""
+    # --- Fine-tuning: real QLoRA training via peft + transformers ---
+
+    FINETUNE_ALPACA_TEMPLATE = (
+        "### Instruction:\n{instruction}\n\n"
+        "### Input:\n{input}\n\n"
+        "### Response:\n{output}"
+    )
+
+    async def _run_finetune(self, job: dict, progress_callback=None) -> dict:
+        """Real QLoRA fine-tuning using peft + transformers + trl."""
         job_id = job["job_id"]
-        total_steps = 10
 
-        for step in range(total_steps):
-            if self._cancel_flag:
-                return {"status": "cancelled", "reason": "Gamer returned", "last_step": step}
+        try:
+            params = json.loads(job.get("prompt", "{}"))
+        except json.JSONDecodeError:
+            return {"status": "failed", "error": "Invalid fine-tune job parameters"}
+
+        run_id = params.get("run_id", "unknown")
+        hf_model_id = params.get("hf_model_id", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+        dataset_url = params.get("dataset_url", "")
+        adapter_upload_url = params.get("adapter_upload_url", "")
+        epochs = params.get("epochs", 3)
+        batch_size = params.get("batch_size", 4)
+        learning_rate = params.get("learning_rate", 2e-4)
+        lora_r = params.get("lora_r", 16)
+        lora_alpha = params.get("lora_alpha", 32)
+        max_steps = params.get("max_steps", -1)
+        sample_count = params.get("sample_count", 0)
+
+        logger.info(f"Fine-tune {run_id[:8]}: {hf_model_id}, {sample_count} samples, {epochs} epochs")
+
+        # Step 1: Download training data from server
+        if progress_callback:
+            await progress_callback(job_id, "Downloading training data...")
+
+        dataset_path = self.model_cache_dir / f"finetune_{run_id}.jsonl"
+        try:
+            await self._download_dataset(dataset_url, dataset_path)
+        except Exception as e:
+            return {"status": "failed", "error": f"Failed to download dataset: {e}"}
+
+        if self._cancel_flag:
+            return {"status": "cancelled", "reason": "Gamer returned"}
+
+        # Step 2: Run training in a thread (blocking GPU work)
+        if progress_callback:
+            await progress_callback(job_id, "Loading model and starting training...")
+
+        loop = asyncio.get_event_loop()
+        training_log = []
+
+        # Progress bridge: called from training thread, posts to async callback
+        def on_train_step(step, total, loss, epoch):
+            training_log.append({"step": step, "loss": loss, "epoch": epoch})
             if progress_callback:
-                await progress_callback(job_id, f"Training step {step + 1}/{total_steps}")
-            await asyncio.sleep(1)
+                asyncio.run_coroutine_threadsafe(
+                    progress_callback(
+                        job_id,
+                        f"Training step {step}/{total} | loss: {loss:.4f}",
+                        finetune_progress={
+                            "step": step,
+                            "total_steps": total,
+                            "loss": loss,
+                            "epoch": epoch,
+                            "log": training_log[-20:],  # last 20 entries
+                        },
+                    ),
+                    loop,
+                )
 
-        logger.info(f"Fine-tune job {job_id[:8]} completed")
-        return {"status": "completed", "result": f"Fine-tuned model saved (mock, {total_steps} steps)"}
+        adapter_output_dir = self.model_cache_dir / f"adapter_{run_id}"
+
+        def do_training():
+            return self._train_lora(
+                hf_model_id=hf_model_id,
+                dataset_path=str(dataset_path),
+                output_dir=str(adapter_output_dir),
+                epochs=epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate,
+                lora_r=lora_r,
+                lora_alpha=lora_alpha,
+                max_steps=max_steps,
+                on_step=on_train_step,
+            )
+
+        try:
+            result = await loop.run_in_executor(None, do_training)
+        except Exception as e:
+            logger.error(f"Fine-tune {run_id[:8]} failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+        if self._cancel_flag:
+            return {"status": "cancelled", "reason": "Gamer returned"}
+
+        # Step 3: Zip and upload adapter to server
+        if progress_callback:
+            await progress_callback(job_id, "Uploading adapter to server...")
+
+        zip_path = self.model_cache_dir / f"adapter_{run_id}.zip"
+        try:
+            self._zip_adapter(str(adapter_output_dir), str(zip_path))
+            await self._upload_adapter(adapter_upload_url, str(zip_path))
+        except Exception as e:
+            logger.warning(f"Adapter upload failed: {e} (adapter saved locally at {adapter_output_dir})")
+
+        if progress_callback:
+            await progress_callback(job_id, "Complete")
+
+        final_loss = training_log[-1]["loss"] if training_log else None
+        total_steps = training_log[-1]["step"] if training_log else 0
+
+        logger.info(f"Fine-tune {run_id[:8]} completed: {total_steps} steps, final loss={final_loss}")
+
+        result_json = json.dumps({
+            "adapter_path": str(adapter_output_dir),
+            "final_loss": final_loss,
+            "total_steps": total_steps,
+            "log": training_log,
+        })
+        return {"status": "completed", "result": result_json}
+
+    def _train_lora(self, hf_model_id: str, dataset_path: str, output_dir: str,
+                    epochs: int, batch_size: int, learning_rate: float,
+                    lora_r: int, lora_alpha: int, max_steps: int,
+                    on_step=None) -> dict:
+        """Blocking function: loads model, trains LoRA, saves adapter. Runs in thread."""
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments
+        from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+        from trl import SFTTrainer, SFTConfig
+        from datasets import load_dataset
+        import transformers
+
+        logger.info(f"Loading tokenizer: {hf_model_id}")
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_id, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Load model in 4-bit for QLoRA
+        logger.info(f"Loading model in 4-bit: {hf_model_id}")
+        use_4bit = torch.cuda.is_available()
+        if use_4bit:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_model_id,
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            model = prepare_model_for_kbit_training(model)
+        else:
+            # CPU fallback — float32, no quantization
+            model = AutoModelForCausalLM.from_pretrained(
+                hf_model_id,
+                device_map="cpu",
+                torch_dtype=torch.float32,
+                trust_remote_code=True,
+            )
+
+        # Configure LoRA adapter
+        logger.info(f"Configuring LoRA: r={lora_r}, alpha={lora_alpha}")
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        )
+        model = get_peft_model(model, lora_config)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        logger.info(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
+
+        # Load dataset
+        logger.info(f"Loading dataset: {dataset_path}")
+        dataset = load_dataset("json", data_files=dataset_path, split="train")
+
+        # Format into text column
+        def format_sample(example):
+            text = self.FINETUNE_ALPACA_TEMPLATE.format(
+                instruction=example.get("instruction", ""),
+                input=example.get("input", ""),
+                output=example.get("output", ""),
+            )
+            return {"text": text}
+
+        dataset = dataset.map(format_sample)
+
+        # Custom callback for progress
+        class ProgressCallback(transformers.TrainerCallback):
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                if on_step and state.global_step > 0:
+                    loss = logs.get("loss", 0) if logs else 0
+                    on_step(state.global_step, state.max_steps, loss, state.epoch or 0)
+
+        # Training arguments
+        training_args = SFTConfig(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=max(1, 4 // batch_size),
+            learning_rate=learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.1,
+            logging_steps=1,
+            save_strategy="epoch",
+            max_steps=max_steps if max_steps > 0 else -1,
+            fp16=torch.cuda.is_available(),
+            optim="adamw_torch",
+            max_seq_length=512,
+            dataset_text_field="text",
+            report_to="none",
+        )
+
+        # Train
+        logger.info("Starting training...")
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            callbacks=[ProgressCallback()],
+        )
+
+        trainer.train()
+
+        # Save adapter only (not the full model)
+        logger.info(f"Saving adapter to {output_dir}")
+        trainer.model.save_pretrained(output_dir)
+        tokenizer.save_pretrained(output_dir)
+
+        # Clean up GPU memory
+        del model
+        del trainer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return {"output_dir": output_dir}
+
+    async def _download_dataset(self, url_path: str, dest: Path):
+        """Download training dataset from server via HTTP."""
+        import httpx
+        # Build full URL from the agent's server connection
+        server_ws = self.model_cache_dir  # We'll get the base URL from the job
+        # The URL path is relative — build from the server's HTTP base
+        # Agent knows the WS URL, derive HTTP from it
+        base_http = self._get_server_http_url()
+        full_url = f"{base_http}{url_path}"
+        logger.info(f"Downloading dataset from {full_url}")
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.get(full_url)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+        logger.info(f"Dataset saved to {dest} ({len(resp.content)} bytes)")
+
+    def _get_server_http_url(self) -> str:
+        """Derive HTTP base URL from the WebSocket URL in config."""
+        from config import load_config
+        config = load_config()
+        ws_url = config["server_url"]
+        # ws://host:port/agents/connect -> http://host:port
+        # wss://host:port/agents/connect -> https://host:port
+        http_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+        # Strip the path
+        from urllib.parse import urlparse
+        parsed = urlparse(http_url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    def _zip_adapter(self, adapter_dir: str, zip_path: str):
+        """Zip the adapter directory for upload."""
+        import shutil
+        shutil.make_archive(zip_path.replace(".zip", ""), "zip", adapter_dir)
+        logger.info(f"Adapter zipped: {zip_path}")
+
+    async def _upload_adapter(self, url_path: str, zip_path: str):
+        """Upload adapter zip to server."""
+        import httpx
+        base_http = self._get_server_http_url()
+        full_url = f"{base_http}{url_path}"
+        logger.info(f"Uploading adapter to {full_url}")
+        async with httpx.AsyncClient(timeout=300) as client:
+            with open(zip_path, "rb") as f:
+                resp = await client.post(
+                    full_url,
+                    files={"file": ("adapter.zip", f, "application/zip")},
+                )
+                resp.raise_for_status()
+        logger.info("Adapter uploaded successfully")
 
     def cancel(self):
         if self.current_job:

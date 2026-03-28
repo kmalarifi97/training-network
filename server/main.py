@@ -18,6 +18,7 @@ from database import init_db, create_cafe, get_cafe, get_cafe_by_api_key, list_c
 from database import upsert_agent, update_agent_heartbeat, set_agent_offline, list_agents, requeue_agent_jobs
 from database import create_job, assign_job, update_job_status, get_job, list_jobs, get_pending_jobs, delete_job, delete_all_jobs
 from database import create_dataset, update_dataset, get_dataset, list_datasets, delete_dataset
+from database import create_finetune_run, update_finetune_run, get_finetune_run, list_finetune_runs, delete_finetune_run
 
 app = FastAPI(title="GPU Network Server")
 
@@ -190,6 +191,17 @@ async def agent_connect(websocket: WebSocket):
                     except Exception:
                         pass
 
+                if job and job["job_type"] == "fine-tune":
+                    try:
+                        prompt_data = json.loads(job["prompt"])
+                        run_id = prompt_data.get("run_id")
+                        if run_id:
+                            update_finetune_run(run_id,
+                                                status="TRAINING",
+                                                started_at=datetime.now().isoformat())
+                    except Exception:
+                        pass
+
             elif data["type"] == "job_progress":
                 job_id = data.get("job_id")
                 progress = data.get("progress", "")
@@ -212,14 +224,61 @@ async def agent_connect(websocket: WebSocket):
                     except Exception:
                         pass
 
+                # Update linked finetune run progress
+                if job and job["job_type"] == "fine-tune":
+                    ft = data.get("finetune_progress", {})
+                    if ft:
+                        try:
+                            prompt_data = json.loads(job["prompt"])
+                            run_id = prompt_data.get("run_id")
+                            if run_id:
+                                update_finetune_run(
+                                    run_id,
+                                    status="TRAINING",
+                                    current_step=ft.get("step", 0),
+                                    total_steps=ft.get("total_steps", 0),
+                                    current_epoch=ft.get("epoch", 0),
+                                    current_loss=ft.get("loss"),
+                                    training_log=json.dumps(ft.get("log", [])),
+                                )
+                        except Exception:
+                            pass
+
             elif data["type"] == "job_completed":
                 job_id = data.get("job_id")
                 result_data = data.get("result", "")
                 update_job_status(job_id, "COMPLETED", result=result_data)
                 print(f"[✓] Job {job_id[:8]} completed by {agent_id}")
 
-                # If this was a dataprep job, save the JSONL and update the dataset
                 job = get_job(job_id)
+
+                # If this was a fine-tune job, update the run record
+                if job and job["job_type"] == "fine-tune":
+                    try:
+                        prompt_data = json.loads(job["prompt"])
+                        run_id = prompt_data.get("run_id")
+                        if run_id:
+                            result_obj = json.loads(result_data) if isinstance(result_data, str) else result_data
+                            adapter_src = result_obj.get("adapter_path", "")
+                            final_loss = result_obj.get("final_loss")
+                            total_steps = result_obj.get("total_steps", 0)
+                            log = result_obj.get("log", [])
+
+                            update_finetune_run(
+                                run_id,
+                                status="COMPLETED",
+                                current_step=total_steps,
+                                total_steps=total_steps,
+                                current_loss=final_loss,
+                                adapter_path=adapter_src,
+                                training_log=json.dumps(log),
+                                completed_at=datetime.now().isoformat(),
+                            )
+                            print(f"[fine-tune] {run_id[:8]}: completed, adapter at {adapter_src}")
+                    except Exception as e:
+                        print(f"[fine-tune] Failed to update run: {e}")
+
+                # If this was a dataprep job, save the JSONL and update the dataset
                 if job and job["job_type"] == "dataprep":
                     try:
                         prompt_data = json.loads(job["prompt"])
@@ -274,6 +333,16 @@ async def agent_connect(websocket: WebSocket):
                         prompt_data = json.loads(job["prompt"])
                         update_dataset(prompt_data["dataset_id"],
                                        status="FAILED", error=error_msg)
+                    except Exception:
+                        pass
+
+                # Update linked finetune run if this was a fine-tune job
+                if job and job["job_type"] == "fine-tune":
+                    try:
+                        prompt_data = json.loads(job["prompt"])
+                        run_id = prompt_data.get("run_id")
+                        if run_id:
+                            update_finetune_run(run_id, status="FAILED", error=error_msg)
                     except Exception:
                         pass
 
@@ -398,6 +467,17 @@ DATAPREP_OUTPUT_DIR = os.environ.get(
 DATAPREP_MAX_UPLOAD_MB = int(os.environ.get("DATAPREP_MAX_UPLOAD_MB", "50"))
 
 Path(DATAPREP_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+FINETUNE_UPLOAD_DIR = os.environ.get(
+    "FINETUNE_UPLOAD_DIR",
+    str(Path(__file__).parent / "finetune_uploads"),
+)
+FINETUNE_ADAPTER_DIR = os.environ.get(
+    "FINETUNE_ADAPTER_DIR",
+    str(Path(__file__).parent / "finetune_adapters"),
+)
+Path(FINETUNE_UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+Path(FINETUNE_ADAPTER_DIR).mkdir(parents=True, exist_ok=True)
 
 
 class TextInput(BaseModel):
@@ -579,6 +659,236 @@ async def remove_dataset(dataset_id: str):
         Path(ds["output_file"]).unlink(missing_ok=True)
     delete_dataset(dataset_id)
     return {"message": "Dataset deleted"}
+
+
+# =============================================================================
+# Fine-tuning — upload dataset, start training, track progress, download adapter
+# =============================================================================
+
+FINETUNE_BASE_MODELS = {
+    "tinyllama-1.1b": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "mistral-7b": "mistralai/Mistral-7B-Instruct-v0.2",
+    "llama3-8b": "meta-llama/Meta-Llama-3-8B-Instruct",
+}
+
+
+@app.post("/finetune/upload")
+async def start_finetune_upload(
+    file: UploadFile = File(...),
+    base_model: str = Form("tinyllama-1.1b"),
+    epochs: int = Form(3),
+    batch_size: int = Form(4),
+    learning_rate: float = Form(0.0002),
+    lora_r: int = Form(16),
+    lora_alpha: int = Form(32),
+    max_steps: int = Form(-1),
+):
+    """Upload a JSONL training file and start a fine-tuning job."""
+    if base_model not in FINETUNE_BASE_MODELS:
+        raise HTTPException(400, f"Unknown model. Choose from: {list(FINETUNE_BASE_MODELS.keys())}")
+
+    if not file.filename.endswith(".jsonl"):
+        raise HTTPException(400, "Only .jsonl files are supported")
+
+    content = await file.read()
+    if len(content) > 100 * 1024 * 1024:
+        raise HTTPException(400, "File too large. Max 100MB")
+
+    # Validate JSONL: each line must be valid JSON
+    lines = content.decode("utf-8", errors="replace").strip().split("\n")
+    for i, line in enumerate(lines[:5]):
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            raise HTTPException(400, f"Invalid JSON on line {i+1}")
+
+    # Save the file
+    run_id = uuid.uuid4().hex
+    dataset_path = Path(FINETUNE_UPLOAD_DIR) / f"{run_id}.jsonl"
+    with open(dataset_path, "wb") as f:
+        f.write(content)
+
+    return await _create_finetune_job(
+        run_id=run_id,
+        base_model=base_model,
+        dataset_file=str(dataset_path),
+        dataset_id=None,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        max_steps=max_steps,
+        sample_count=len(lines),
+    )
+
+
+@app.post("/finetune/from-dataset/{dataset_id}")
+async def start_finetune_from_dataset(
+    dataset_id: str,
+    base_model: str = "tinyllama-1.1b",
+    epochs: int = 3,
+    batch_size: int = 4,
+    learning_rate: float = 0.0002,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    max_steps: int = -1,
+):
+    """Start fine-tuning using an existing generated dataset."""
+    if base_model not in FINETUNE_BASE_MODELS:
+        raise HTTPException(400, f"Unknown model. Choose from: {list(FINETUNE_BASE_MODELS.keys())}")
+
+    ds = get_dataset(dataset_id)
+    if not ds:
+        raise HTTPException(404, "Dataset not found")
+    if ds["status"] != "COMPLETED":
+        raise HTTPException(400, f"Dataset not ready. Status: {ds['status']}")
+    if not ds["output_file"] or not Path(ds["output_file"]).exists():
+        raise HTTPException(404, "Dataset output file not found")
+
+    run_id = uuid.uuid4().hex
+
+    return await _create_finetune_job(
+        run_id=run_id,
+        base_model=base_model,
+        dataset_file=ds["output_file"],
+        dataset_id=dataset_id,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        max_steps=max_steps,
+        sample_count=ds["total_pairs"],
+    )
+
+
+async def _create_finetune_job(run_id: str, base_model: str, dataset_file: str,
+                                dataset_id: str | None, epochs: int, batch_size: int,
+                                learning_rate: float, lora_r: int, lora_alpha: int,
+                                max_steps: int, sample_count: int) -> dict:
+    """Create a finetune_run record + job, assign to a GPU agent."""
+    job_id = uuid.uuid4().hex
+
+    create_finetune_run(
+        run_id=run_id,
+        base_model=base_model,
+        dataset_file=dataset_file,
+        dataset_id=dataset_id,
+        epochs=epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        max_steps=max_steps,
+    )
+
+    # The prompt carries all config the agent needs
+    job_prompt = json.dumps({
+        "run_id": run_id,
+        "base_model": base_model,
+        "hf_model_id": FINETUNE_BASE_MODELS[base_model],
+        "dataset_url": f"/finetune/{run_id}/dataset",
+        "adapter_upload_url": f"/finetune/{run_id}/adapter",
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
+        "max_steps": max_steps,
+        "sample_count": sample_count,
+    })
+
+    create_job(job_id, "fine-tune", base_model, job_prompt)
+    update_finetune_run(run_id, job_id=job_id)
+
+    print(f"[fine-tune] {run_id[:8]}: job {job_id[:8]} queued ({base_model}, {sample_count} samples)")
+
+    await try_assign_jobs()
+
+    return {"run_id": run_id, "job_id": job_id, "status": "PENDING"}
+
+
+@app.get("/finetune")
+async def get_finetune_runs(status: str | None = None, limit: int = 100):
+    runs = list_finetune_runs(status=status, limit=limit)
+    return {"total": len(runs), "runs": runs}
+
+
+@app.get("/finetune/{run_id}")
+async def get_finetune_status(run_id: str):
+    run = get_finetune_run(run_id)
+    if not run:
+        raise HTTPException(404, "Fine-tune run not found")
+    return run
+
+
+@app.get("/finetune/{run_id}/dataset")
+async def download_finetune_dataset(run_id: str):
+    """Agent downloads the training data from this endpoint."""
+    run = get_finetune_run(run_id)
+    if not run:
+        raise HTTPException(404, "Fine-tune run not found")
+    if not run["dataset_file"] or not Path(run["dataset_file"]).exists():
+        raise HTTPException(404, "Dataset file not found")
+    return FileResponse(
+        run["dataset_file"],
+        media_type="application/jsonl",
+        filename=f"train_{run_id}.jsonl",
+    )
+
+
+@app.post("/finetune/{run_id}/adapter")
+async def upload_adapter(run_id: str, file: UploadFile = File(...)):
+    """Agent uploads the trained adapter zip back to the server."""
+    run = get_finetune_run(run_id)
+    if not run:
+        raise HTTPException(404, "Fine-tune run not found")
+
+    adapter_dir = Path(FINETUNE_ADAPTER_DIR) / run_id
+    adapter_dir.mkdir(parents=True, exist_ok=True)
+    adapter_path = adapter_dir / file.filename
+
+    content = await file.read()
+    with open(adapter_path, "wb") as f:
+        f.write(content)
+
+    update_finetune_run(run_id, adapter_path=str(adapter_path))
+    print(f"[fine-tune] {run_id[:8]}: adapter uploaded ({len(content)} bytes)")
+    return {"message": "Adapter uploaded", "path": str(adapter_path)}
+
+
+@app.get("/finetune/{run_id}/download")
+async def download_adapter(run_id: str):
+    run = get_finetune_run(run_id)
+    if not run:
+        raise HTTPException(404, "Fine-tune run not found")
+    if run["status"] != "COMPLETED":
+        raise HTTPException(400, f"Training not complete. Status: {run['status']}")
+    if not run["adapter_path"] or not Path(run["adapter_path"]).exists():
+        raise HTTPException(404, "Adapter file not found")
+    return FileResponse(
+        run["adapter_path"],
+        media_type="application/zip",
+        filename=f"adapter_{run_id}.zip",
+    )
+
+
+@app.delete("/finetune/{run_id}")
+async def remove_finetune_run(run_id: str):
+    run = get_finetune_run(run_id)
+    if not run:
+        raise HTTPException(404, "Fine-tune run not found")
+    # Clean up files
+    if run["dataset_file"]:
+        Path(run["dataset_file"]).unlink(missing_ok=True)
+    if run["adapter_path"]:
+        Path(run["adapter_path"]).unlink(missing_ok=True)
+        parent = Path(run["adapter_path"]).parent
+        if parent.exists() and not list(parent.iterdir()):
+            parent.rmdir()
+    delete_finetune_run(run_id)
+    return {"message": "Fine-tune run deleted"}
 
 
 if __name__ == "__main__":

@@ -17,7 +17,14 @@ Platform connecting idle gaming cafe GPUs (Saudi Arabia) to customers needing AI
   - Windows Service wrapper
   - Inno Setup installer script + PyInstaller build script
   - Config: cross-platform paths, env var overrides
-- Phase 5: Fine-tuning pipeline - NEXT
+- Phase 5: Fine-tuning pipeline (QLoRA via peft/transformers/trl) - DONE
+  - Upload JSONL training data via API/UI
+  - Real QLoRA training on GPU agents (4-bit quantization)
+  - LoRA adapter saving + server upload
+  - Live training progress (step, loss, epoch)
+  - Fine-Tuning tab in web UI
+  - Download trained adapter
+  - Support for TinyLlama, Mistral 7B, LLaMA 3 8B base models
 - Phase 6: Web dashboard - TODO
 - Phase 7: Billing - TODO
 - Phase 8: Packaging (.exe installer) - MOSTLY DONE (build scripts ready)
@@ -37,6 +44,8 @@ Platform connecting idle gaming cafe GPUs (Saudi Arabia) to customers needing AI
 - `server/database.py` - SQLite database layer (cafes, agents, jobs)
 - `build/build_exe.py` - PyInstaller build script
 - `build/installer.iss` - Inno Setup installer script
+- `server/finetune_uploads/` - Uploaded JSONL training files
+- `server/finetune_adapters/` - Trained LoRA adapter outputs
 - `README-TRAINING-NETWORK.md` - Full build plan with all 8 phases
 
 ## Technical Details

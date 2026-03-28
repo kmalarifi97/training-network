@@ -104,6 +104,37 @@ def init_db():
             );
 
             CREATE INDEX IF NOT EXISTS idx_datasets_status ON datasets(status);
+
+            CREATE TABLE IF NOT EXISTS finetune_runs (
+                run_id TEXT PRIMARY KEY,
+                base_model TEXT NOT NULL,
+                dataset_id TEXT,
+                dataset_file TEXT,
+                status TEXT DEFAULT 'PENDING',
+                job_id TEXT,
+                -- Training config
+                epochs INTEGER DEFAULT 3,
+                batch_size INTEGER DEFAULT 4,
+                learning_rate REAL DEFAULT 0.0002,
+                lora_r INTEGER DEFAULT 16,
+                lora_alpha INTEGER DEFAULT 32,
+                max_steps INTEGER DEFAULT -1,
+                -- Progress
+                current_step INTEGER DEFAULT 0,
+                total_steps INTEGER DEFAULT 0,
+                current_epoch REAL DEFAULT 0,
+                current_loss REAL,
+                -- Output
+                adapter_path TEXT,
+                training_log TEXT,
+                error TEXT,
+                -- Timestamps
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_finetune_status ON finetune_runs(status);
         """)
 
 
@@ -345,3 +376,60 @@ def list_datasets(status: str | None = None, limit: int = 100) -> list[dict]:
 def delete_dataset(dataset_id: str):
     with get_db() as conn:
         conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
+
+
+# --- Fine-tune run operations ---
+
+def create_finetune_run(run_id: str, base_model: str, dataset_file: str,
+                        dataset_id: str | None = None,
+                        epochs: int = 3, batch_size: int = 4,
+                        learning_rate: float = 2e-4,
+                        lora_r: int = 16, lora_alpha: int = 32,
+                        max_steps: int = -1) -> dict:
+    now = datetime.now().isoformat()
+    with get_db() as conn:
+        conn.execute("""
+            INSERT INTO finetune_runs (run_id, base_model, dataset_id, dataset_file,
+                                       epochs, batch_size, learning_rate,
+                                       lora_r, lora_alpha, max_steps, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (run_id, base_model, dataset_id, dataset_file,
+              epochs, batch_size, learning_rate,
+              lora_r, lora_alpha, max_steps, now))
+    return {"run_id": run_id, "status": "PENDING", "created_at": now}
+
+
+def update_finetune_run(run_id: str, **kwargs):
+    sets = []
+    vals = []
+    for key, val in kwargs.items():
+        sets.append(f"{key} = ?")
+        vals.append(val)
+    vals.append(run_id)
+    with get_db() as conn:
+        conn.execute(f"UPDATE finetune_runs SET {', '.join(sets)} WHERE run_id = ?", vals)
+
+
+def get_finetune_run(run_id: str) -> dict | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM finetune_runs WHERE run_id = ?", (run_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_finetune_runs(status: str | None = None, limit: int = 100) -> list[dict]:
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM finetune_runs WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM finetune_runs ORDER BY created_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_finetune_run(run_id: str):
+    with get_db() as conn:
+        conn.execute("DELETE FROM finetune_runs WHERE run_id = ?", (run_id,))
