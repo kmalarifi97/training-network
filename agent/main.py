@@ -122,8 +122,8 @@ class Agent:
     async def _execute_job(self, job_data: dict):
         job_id = job_data["job_id"]
 
-        async def progress_callback(jid: str, progress: str):
-            await self.connection.send_job_progress(jid, progress)
+        async def progress_callback(jid: str, progress: str, **extra):
+            await self.connection.send_job_progress(jid, progress, **extra)
 
         result = await self.job_runner.run_job(job_data, progress_callback)
 
