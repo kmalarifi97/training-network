@@ -470,11 +470,13 @@ class JobRunner:
                     on_step=None) -> dict:
         """Blocking function: loads model, trains LoRA, saves adapter. Runs in thread."""
         import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments
+        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+        from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-        from trl import SFTTrainer
         from datasets import load_dataset
         import transformers
+
+        MAX_SEQ_LEN = 512
 
         logger.info(f"Loading tokenizer: {hf_model_id}")
         tokenizer = AutoTokenizer.from_pretrained(hf_model_id, trust_remote_code=True)
@@ -499,7 +501,6 @@ class JobRunner:
             )
             model = prepare_model_for_kbit_training(model)
         else:
-            # CPU fallback — float32, no quantization
             model = AutoModelForCausalLM.from_pretrained(
                 hf_model_id,
                 device_map="cpu",
@@ -522,20 +523,26 @@ class JobRunner:
         total = sum(p.numel() for p in model.parameters())
         logger.info(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
-        # Load dataset
+        # Load and tokenize dataset
         logger.info(f"Loading dataset: {dataset_path}")
         dataset = load_dataset("json", data_files=dataset_path, split="train")
 
-        # Format into text column
-        def format_sample(example):
+        def tokenize(example):
             text = self.FINETUNE_ALPACA_TEMPLATE.format(
                 instruction=example.get("instruction", ""),
                 input=example.get("input", ""),
                 output=example.get("output", ""),
             )
-            return {"text": text}
+            tokens = tokenizer(
+                text,
+                truncation=True,
+                max_length=MAX_SEQ_LEN,
+                padding="max_length",
+            )
+            tokens["labels"] = tokens["input_ids"].copy()
+            return tokens
 
-        dataset = dataset.map(format_sample)
+        dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
 
         # Custom callback for progress
         class ProgressCallback(transformers.TrainerCallback):
@@ -561,15 +568,15 @@ class JobRunner:
             report_to="none",
         )
 
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
         # Train
         logger.info("Starting training...")
-        trainer = SFTTrainer(
+        trainer = Trainer(
             model=model,
             args=training_args,
             train_dataset=dataset,
-            processing_class=tokenizer,
-            max_seq_length=512,
-            dataset_text_field="text",
+            data_collator=data_collator,
             callbacks=[ProgressCallback()],
         )
 
