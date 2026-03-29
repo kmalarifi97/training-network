@@ -472,7 +472,7 @@ class JobRunner:
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments
         from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-        from trl import SFTTrainer, SFTConfig
+        from trl import SFTTrainer
         from datasets import load_dataset
         import transformers
 
@@ -545,7 +545,7 @@ class JobRunner:
                     on_step(state.global_step, state.max_steps, loss, state.epoch or 0)
 
         # Training arguments
-        training_args = SFTConfig(
+        training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=epochs,
             per_device_train_batch_size=batch_size,
@@ -558,8 +558,6 @@ class JobRunner:
             max_steps=max_steps if max_steps > 0 else -1,
             fp16=torch.cuda.is_available(),
             optim="adamw_torch",
-            max_seq_length=512,
-            dataset_text_field="text",
             report_to="none",
         )
 
@@ -570,6 +568,8 @@ class JobRunner:
             args=training_args,
             train_dataset=dataset,
             processing_class=tokenizer,
+            max_seq_length=512,
+            dataset_text_field="text",
             callbacks=[ProgressCallback()],
         )
 
