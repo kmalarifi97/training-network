@@ -4,7 +4,10 @@ import logging
 import re
 from pathlib import Path
 
-from llama_cpp import Llama
+try:
+    from llama_cpp import Llama
+except ImportError:
+    Llama = None  # Fine-tuning works without llama_cpp
 
 logger = logging.getLogger("agent.job_runner")
 
