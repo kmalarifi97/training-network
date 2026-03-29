@@ -57,6 +57,9 @@ ExecStart=$PROJECT_DIR/venv/bin/python main.py
 Restart=always
 RestartSec=5
 Environment=PORT=8000
+Environment=GEMINI_API_KEY=${GEMINI_API_KEY:-}
+Environment=GCP_PROJECT_ID=${GCP_PROJECT_ID:-training-network-sa}
+Environment=DOCAI_PROCESSOR_ID=${DOCAI_PROCESSOR_ID:-242349cfad9c29c}
 
 [Install]
 WantedBy=multi-user.target
