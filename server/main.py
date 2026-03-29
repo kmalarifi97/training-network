@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -457,8 +458,10 @@ async def delete_all_jobs_endpoint():
 
 
 # =============================================================================
-# Dataset generation — all processing happens on GPU agents
+# Dataset generation — GCP pipeline (Document AI + Gemini)
 # =============================================================================
+
+from gcp_dataprep import run_pipeline, run_text_pipeline, run_csv_pipeline
 
 DATAPREP_OUTPUT_DIR = os.environ.get(
     "DATAPREP_OUTPUT_DIR",
@@ -482,124 +485,291 @@ Path(FINETUNE_ADAPTER_DIR).mkdir(parents=True, exist_ok=True)
 
 class TextInput(BaseModel):
     text: str
-    model_name: str | None = None
-    strategy: str = "self-instruct"
     output_format: str = "alpaca"
-    pairs_per_chunk: int | None = None
+    pairs_per_chunk: int = 10
 
 
 @app.post("/datasets/generate/file")
 async def generate_from_file(
     file: UploadFile = File(...),
-    model_name: str = Form("mistral-7b"),
-    strategy: str = Form("self-instruct"),
     output_format: str = Form("alpaca"),
-    pairs_per_chunk: int = Form(3),
+    pairs_per_chunk: int = Form(10),
 ):
-    """Upload a file and send it to a GPU agent for dataset generation."""
+    """Upload a file — routes to the right pipeline based on type.
+    PDF -> Document AI + Gemini
+    CSV/ZIP(csv) -> Gemini CSV pipeline
+    TXT/DOCX -> Gemini text pipeline
+    """
     max_bytes = DATAPREP_MAX_UPLOAD_MB * 1024 * 1024
     content = await file.read()
     if len(content) > max_bytes:
         raise HTTPException(400, f"File too large. Max {DATAPREP_MAX_UPLOAD_MB}MB")
 
-    # Read text from file on server side (lightweight, no model needed)
-    import tempfile
-    suffix = Path(file.filename).suffix
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+    suffix = Path(file.filename).suffix.lower()
 
-    try:
-        # Extract text — only import needed: PyPDF2/python-docx for PDF/DOCX
-        if suffix.lower() == ".pdf":
-            try:
-                import PyPDF2
-                parts = []
-                with open(tmp_path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    for page in reader.pages:
-                        t = page.extract_text()
-                        if t:
-                            parts.append(t)
-                text = "\n\n".join(parts)
-            except ImportError:
-                raise HTTPException(500, "PyPDF2 not installed on server")
-        elif suffix.lower() in (".docx", ".doc"):
-            try:
-                import docx
-                doc = docx.Document(tmp_path)
-                text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
-            except ImportError:
-                raise HTTPException(500, "python-docx not installed on server")
+    # --- ZIP: extract and detect inner file type ---
+    if suffix == ".zip":
+        import zipfile
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(content))
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "Invalid ZIP file")
+
+        csv_files = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        pdf_files = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+
+        if csv_files:
+            inner_bytes = zf.read(csv_files[0])
+            inner_name = csv_files[0]
+            return await _run_csv_dataprep(
+                csv_bytes=inner_bytes,
+                source_filename=f"{file.filename}/{inner_name}",
+                output_format=output_format,
+                pairs_per_chunk=pairs_per_chunk,
+            )
+        elif pdf_files:
+            inner_bytes = zf.read(pdf_files[0])
+            inner_name = pdf_files[0]
+            return await _start_pdf_pipeline(
+                pdf_bytes=inner_bytes,
+                source_filename=f"{file.filename}/{inner_name}",
+                output_format=output_format,
+                pairs_per_chunk=pairs_per_chunk,
+            )
         else:
-            text = content.decode("utf-8", errors="replace")
-    finally:
-        os.unlink(tmp_path)
+            raise HTTPException(400, "ZIP must contain a CSV or PDF file")
 
+    # --- CSV: direct to CSV pipeline ---
+    if suffix == ".csv":
+        return await _run_csv_dataprep(
+            csv_bytes=content,
+            source_filename=file.filename,
+            output_format=output_format,
+            pairs_per_chunk=pairs_per_chunk,
+        )
+
+    # --- PDF: Document AI + Gemini ---
+    if suffix == ".pdf":
+        return await _start_pdf_pipeline(
+            pdf_bytes=content,
+            source_filename=file.filename,
+            output_format=output_format,
+            pairs_per_chunk=pairs_per_chunk,
+        )
+
+    # --- DOCX ---
+    if suffix in (".docx", ".doc"):
+        try:
+            import docx as docx_lib
+            import tempfile as tmp_mod
+            with tmp_mod.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            doc = docx_lib.Document(tmp_path)
+            text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            os.unlink(tmp_path)
+        except ImportError:
+            raise HTTPException(500, "python-docx not installed on server")
+
+        if not text.strip():
+            raise HTTPException(400, "No text could be extracted from file")
+
+        return await _run_text_dataprep(
+            text=text, source_filename=file.filename,
+            output_format=output_format, pairs_per_chunk=pairs_per_chunk,
+        )
+
+    # --- Plain text fallback ---
+    text = content.decode("utf-8", errors="replace")
     if not text.strip():
         raise HTTPException(400, "No text could be extracted from file")
 
-    return await _create_dataprep_job(
-        text=text,
-        source_filename=file.filename,
-        model_name=model_name,
-        strategy=strategy,
+    return await _run_text_dataprep(
+        text=text, source_filename=file.filename,
+        output_format=output_format, pairs_per_chunk=pairs_per_chunk,
+    )
+
+
+async def _start_pdf_pipeline(pdf_bytes: bytes, source_filename: str,
+                                output_format: str, pairs_per_chunk: int) -> dict:
+    """Create dataset record and launch PDF pipeline in background."""
+    dataset_id = uuid.uuid4().hex
+    create_dataset(
+        dataset_id=dataset_id,
+        source_filename=source_filename,
+        source_type="pdf",
+        model_name="gemini",
+        strategy="gcp-pdf",
         output_format=output_format,
+        chunk_size=0,
         pairs_per_chunk=pairs_per_chunk,
     )
+    update_dataset(dataset_id, status="PROCESSING",
+                   started_at=datetime.now().isoformat())
+
+    print(f"[dataprep] {dataset_id[:8]}: starting PDF pipeline ({len(pdf_bytes)} bytes)")
+    asyncio.create_task(_run_gcp_pipeline(dataset_id, pdf_bytes,
+                                          pairs_per_chunk, output_format))
+    return {"dataset_id": dataset_id, "status": "PROCESSING"}
+
+
+async def _run_csv_dataprep(csv_bytes: bytes, source_filename: str,
+                             output_format: str, pairs_per_chunk: int) -> dict:
+    """Create dataset record and launch CSV pipeline in background."""
+    dataset_id = uuid.uuid4().hex
+    create_dataset(
+        dataset_id=dataset_id,
+        source_filename=source_filename,
+        source_type="csv",
+        model_name="gemini",
+        strategy="gcp-csv",
+        output_format=output_format,
+        chunk_size=0,
+        pairs_per_chunk=pairs_per_chunk,
+    )
+    update_dataset(dataset_id, status="PROCESSING",
+                   started_at=datetime.now().isoformat())
+
+    print(f"[dataprep] {dataset_id[:8]}: starting CSV pipeline ({len(csv_bytes)} bytes)")
+    asyncio.create_task(_run_csv_pipeline_task(dataset_id, csv_bytes,
+                                                pairs_per_chunk, output_format))
+    return {"dataset_id": dataset_id, "status": "PROCESSING"}
 
 
 @app.post("/datasets/generate/text")
 async def generate_from_text(req: TextInput):
-    """Submit raw text — sent to a GPU agent for dataset generation."""
+    """Submit raw text — generate training pairs via Gemini."""
     if not req.text.strip():
         raise HTTPException(400, "Text cannot be empty")
 
-    return await _create_dataprep_job(
+    return await _run_text_dataprep(
         text=req.text,
         source_filename="raw_text",
-        model_name=req.model_name or "mistral-7b",
-        strategy=req.strategy,
         output_format=req.output_format,
-        pairs_per_chunk=req.pairs_per_chunk or 3,
+        pairs_per_chunk=req.pairs_per_chunk,
     )
 
 
-async def _create_dataprep_job(text: str, source_filename: str, model_name: str,
-                                strategy: str, output_format: str,
-                                pairs_per_chunk: int) -> dict:
-    """Create a dataset record + a dataprep job, assign to GPU agent."""
+async def _run_text_dataprep(text: str, source_filename: str,
+                              output_format: str, pairs_per_chunk: int) -> dict:
+    """Create dataset record and run Gemini text pipeline in background."""
     dataset_id = uuid.uuid4().hex
-    job_id = uuid.uuid4().hex
 
     create_dataset(
         dataset_id=dataset_id,
         source_filename=source_filename,
         source_type=Path(source_filename).suffix.lower().lstrip(".") or "txt",
-        model_name=model_name,
-        strategy=strategy,
+        model_name="gemini",
+        strategy="gcp-pipeline",
         output_format=output_format,
         chunk_size=0,
         pairs_per_chunk=pairs_per_chunk,
     )
+    update_dataset(dataset_id, status="PROCESSING",
+                   started_at=datetime.now().isoformat())
 
-    # The prompt field carries all the data the agent needs
-    job_prompt = json.dumps({
-        "text": text,
-        "dataset_id": dataset_id,
-        "strategy": strategy,
-        "output_format": output_format,
-        "pairs_per_chunk": pairs_per_chunk,
-    })
+    print(f"[dataprep] {dataset_id[:8]}: starting Gemini text pipeline ({len(text)} chars)")
 
-    create_job(job_id, "dataprep", model_name, job_prompt)
-    update_dataset(dataset_id, status="PENDING")
+    asyncio.create_task(_run_text_pipeline_task(dataset_id, text,
+                                                 pairs_per_chunk, output_format))
 
-    print(f"[dataprep] {dataset_id[:8]}: job {job_id[:8]} queued ({len(text)} chars)")
+    return {"dataset_id": dataset_id, "status": "PROCESSING"}
 
-    await try_assign_jobs()
 
-    return {"dataset_id": dataset_id, "job_id": job_id, "status": "PENDING"}
+async def _run_gcp_pipeline(dataset_id: str, pdf_bytes: bytes,
+                             pairs_per_chunk: int, output_format: str):
+    """Background task: Document AI + Gemini pipeline."""
+    try:
+        async def on_progress(**kwargs):
+            update_dataset(dataset_id, **{k: v for k, v in kwargs.items()
+                                          if k in ("status", "total_chunks",
+                                                    "processed_chunks", "total_pairs")})
+
+        pairs = await run_pipeline(
+            pdf_bytes, pairs_per_chunk, output_format, progress_callback=on_progress
+        )
+
+        output_path = Path(DATAPREP_OUTPUT_DIR) / f"{dataset_id}.jsonl"
+        with open(output_path, "w", encoding="utf-8") as f:
+            for pair in pairs:
+                f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+
+        update_dataset(
+            dataset_id,
+            status="COMPLETED",
+            output_file=str(output_path),
+            total_pairs=len(pairs),
+            completed_at=datetime.now().isoformat(),
+        )
+        print(f"[dataprep] {dataset_id[:8]}: completed — {len(pairs)} pairs")
+
+    except Exception as e:
+        print(f"[dataprep] {dataset_id[:8]}: FAILED — {e}")
+        update_dataset(dataset_id, status="FAILED", error=str(e))
+
+
+async def _run_text_pipeline_task(dataset_id: str, text: str,
+                                   pairs_per_chunk: int, output_format: str):
+    """Background task: Gemini-only pipeline for raw text."""
+    try:
+        async def on_progress(**kwargs):
+            update_dataset(dataset_id, **{k: v for k, v in kwargs.items()
+                                          if k in ("status", "total_chunks",
+                                                    "processed_chunks", "total_pairs")})
+
+        pairs = await run_text_pipeline(
+            text, pairs_per_chunk, output_format, progress_callback=on_progress
+        )
+
+        output_path = Path(DATAPREP_OUTPUT_DIR) / f"{dataset_id}.jsonl"
+        with open(output_path, "w", encoding="utf-8") as f:
+            for pair in pairs:
+                f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+
+        update_dataset(
+            dataset_id,
+            status="COMPLETED",
+            output_file=str(output_path),
+            total_pairs=len(pairs),
+            completed_at=datetime.now().isoformat(),
+        )
+        print(f"[dataprep] {dataset_id[:8]}: completed — {len(pairs)} pairs")
+
+    except Exception as e:
+        print(f"[dataprep] {dataset_id[:8]}: FAILED — {e}")
+        update_dataset(dataset_id, status="FAILED", error=str(e))
+
+
+async def _run_csv_pipeline_task(dataset_id: str, csv_bytes: bytes,
+                                  pairs_per_batch: int, output_format: str):
+    """Background task: CSV -> Gemini pipeline."""
+    try:
+        async def on_progress(**kwargs):
+            update_dataset(dataset_id, **{k: v for k, v in kwargs.items()
+                                          if k in ("status", "total_chunks",
+                                                    "processed_chunks", "total_pairs")})
+
+        pairs = await run_csv_pipeline(
+            csv_bytes, pairs_per_batch, output_format, progress_callback=on_progress
+        )
+
+        output_path = Path(DATAPREP_OUTPUT_DIR) / f"{dataset_id}.jsonl"
+        with open(output_path, "w", encoding="utf-8") as f:
+            for pair in pairs:
+                f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+
+        update_dataset(
+            dataset_id,
+            status="COMPLETED",
+            output_file=str(output_path),
+            total_pairs=len(pairs),
+            completed_at=datetime.now().isoformat(),
+        )
+        print(f"[dataprep] {dataset_id[:8]}: CSV completed — {len(pairs)} pairs")
+
+    except Exception as e:
+        print(f"[dataprep] {dataset_id[:8]}: CSV FAILED — {e}")
+        update_dataset(dataset_id, status="FAILED", error=str(e))
 
 
 @app.get("/datasets")

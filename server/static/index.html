@@ -706,31 +706,23 @@
                             <div class="form-row">
                                 <label>Source File</label>
                                 <div class="drop-zone" id="drop-zone">
-                                    <input type="file" id="ds-file" accept=".txt,.pdf,.docx,.doc,.md,.json">
+                                    <input type="file" id="ds-file" accept=".pdf,.csv,.zip,.txt,.docx,.doc,.md,.json">
                                     <div class="drop-zone-text" id="drop-zone-text">
                                         <strong>Click to browse</strong> or drag and drop<br>
                                     </div>
-                                    <div class="drop-zone-hint">TXT, PDF, DOCX, MD — max 50MB</div>
+                                    <div class="drop-zone-hint">PDF, CSV, ZIP, TXT, DOCX — max 50MB</div>
                                 </div>
                             </div>
                             <div class="form-row">
                                 <label>Or paste text directly</label>
                                 <textarea id="ds-text" placeholder="Paste your text content here..." style="min-height:80px"></textarea>
                             </div>
-                            <div class="form-row-inline">
-                                <div class="form-row">
-                                    <label>Model</label>
-                                    <select id="ds-model">
-                                        <option value="tinyllama-1.1b">TinyLlama 1.1B (fast)</option>
-                                        <option value="mistral-7b" selected>Mistral 7B (better)</option>
-                                    </select>
-                                </div>
-                                <div class="form-row">
-                                    <label>Strategy</label>
-                                    <select id="ds-strategy">
-                                        <option value="self-instruct">Self-Instruct</option>
-                                        <option value="genstruct">Genstruct</option>
-                                    </select>
+                            <div class="form-row" style="padding:10px 14px;background:#0d1b2a;border:1px solid #1e3a5f;border-radius:8px;margin-bottom:14px">
+                                <div style="font-size:11px;color:#6b7b8d;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">GCP Pipeline</div>
+                                <div style="font-size:12px;color:#9ca3af;line-height:1.6">
+                                    <strong style="color:#00d4ff">PDF</strong>: Document AI &rarr; Gemini<br>
+                                    <strong style="color:#00d4ff">CSV</strong>: Row batching &rarr; Gemini<br>
+                                    <strong style="color:#00d4ff">TXT</strong>: Chunking &rarr; Gemini
                                 </div>
                             </div>
                             <div class="form-row-inline">
@@ -743,7 +735,7 @@
                                 </div>
                                 <div class="form-row">
                                     <label>Pairs per Chunk</label>
-                                    <input type="number" id="ds-pairs" value="3" min="1" max="10">
+                                    <input type="number" id="ds-pairs" value="10" min="1" max="20">
                                 </div>
                             </div>
                             <button type="submit" class="submit-btn" id="ds-submit-btn">Generate Dataset</button>
@@ -1029,8 +1021,6 @@
             if (selectedFile) {
                 const form = new FormData();
                 form.append('file', selectedFile);
-                form.append('model_name', document.getElementById('ds-model').value);
-                form.append('strategy', document.getElementById('ds-strategy').value);
                 form.append('output_format', document.getElementById('ds-format').value);
                 form.append('pairs_per_chunk', document.getElementById('ds-pairs').value);
                 res = await fetch(`${API}/datasets/generate/file`, { method: 'POST', body: form });
@@ -1040,8 +1030,6 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         text: text,
-                        model_name: document.getElementById('ds-model').value,
-                        strategy: document.getElementById('ds-strategy').value,
                         output_format: document.getElementById('ds-format').value,
                         pairs_per_chunk: parseInt(document.getElementById('ds-pairs').value),
                     })
@@ -1098,8 +1086,7 @@
                         </div>
                         <div class="ds-meta">
                             ${escapeHtml(ds.source_filename)} &middot;
-                            ${ds.model_name} &middot;
-                            ${ds.strategy} &middot;
+                            ${ds.strategy === 'gcp-csv' ? 'CSV' : ds.strategy === 'gcp-pdf' ? 'PDF' : 'Text'} Pipeline &middot;
                             ${formatTime(ds.created_at)}
                         </div>
                         ${isActive ? `
