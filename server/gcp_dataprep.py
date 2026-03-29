@@ -24,6 +24,10 @@ GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "training-network-sa")
 GCP_LOCATION = os.environ.get("GCP_LOCATION", "us")
 DOCAI_PROCESSOR_ID = os.environ.get("DOCAI_PROCESSOR_ID", "242349cfad9c29c")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if not GEMINI_API_KEY:
+    print("[gcp_dataprep] WARNING: GEMINI_API_KEY is not set!")
+else:
+    print(f"[gcp_dataprep] Gemini API key loaded: {GEMINI_API_KEY[:10]}...")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 DOCAI_ENDPOINT = (
@@ -155,7 +159,7 @@ GENERATION_PROMPT = """أنت خبير في إنشاء بيانات تدريب �
 
 كل زوج يجب أن يكون بنفس لغة النص ويتضمن:
 - instruction: سؤال أو طلب واضح ومتنوع
-- input: سياق من النص إذا لزم (أو فارغ)
+- input: سياق من النص إذا لزم (أو نص فارغ "")
 - output: إجابة دقيقة ومفصلة مبنية على النص
 
 نوّع في أنواع الأسئلة: فهم، تلخيص، شرح مفاهيم، مقارنة، تحليل، استنتاج، تعريف مصطلحات.
@@ -163,7 +167,9 @@ GENERATION_PROMPT = """أنت خبير في إنشاء بيانات تدريب �
 النص:
 {text}
 
-أعد النتيجة كـ JSONL فقط (سطر JSON واحد لكل زوج). بدون أي شرح إضافي أو markdown."""
+أعد النتيجة كـ JSONL فقط (سطر JSON واحد لكل زوج). بدون أي شرح إضافي أو markdown أو code fences.
+مهم: جميع القيم يجب أن تكون نصوص (strings) وليس كائنات أو مصفوفات.
+كل سطر يجب أن يكون بالضبط: {{"instruction": "نص", "input": "نص", "output": "نص"}}"""
 
 
 async def generate_pairs_gemini(chunks: list[str], pairs_per_chunk: int = 10,
@@ -179,23 +185,26 @@ async def generate_pairs_gemini(chunks: list[str], pairs_per_chunk: int = 10,
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.7,
-                    "maxOutputTokens": 4096,
+                    "maxOutputTokens": 8192,
+                    "thinkingConfig": {"thinkingBudget": 0},
                 },
             }
 
             try:
-                resp = await client.post(
-                    f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
-                    json=payload,
-                )
+                url = f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}"
+                resp = await client.post(url, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
+
+                if "error" in data:
+                    print(f"[gemini] Chunk {i+1}: API error: {data['error'].get('message','?')}")
+                    continue
 
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 pairs = _parse_jsonl(text, output_format)
                 all_pairs.extend(pairs)
 
-                logger.info(f"Chunk {i+1}/{len(chunks)}: {len(pairs)} pairs")
+                print(f"[gemini] Chunk {i+1}/{len(chunks)}: {len(pairs)} pairs (raw: {len(text)} chars)")
 
                 if progress_callback:
                     await progress_callback(
@@ -205,7 +214,7 @@ async def generate_pairs_gemini(chunks: list[str], pairs_per_chunk: int = 10,
                     )
 
             except Exception as e:
-                logger.error(f"Chunk {i+1}/{len(chunks)} failed: {e}")
+                print(f"[gemini] Chunk {i+1}/{len(chunks)} EXCEPTION: {type(e).__name__}: {e}")
 
             # Small delay to avoid rate limits
             if i < len(chunks) - 1:
@@ -215,34 +224,87 @@ async def generate_pairs_gemini(chunks: list[str], pairs_per_chunk: int = 10,
 
 
 def _parse_jsonl(raw: str, output_format: str) -> list[dict]:
-    """Parse Gemini output into training pairs."""
-    lines = [l.strip() for l in raw.strip().split("\n")
-             if l.strip() and not l.strip().startswith("`")]
+    """Parse Gemini output into training pairs.
+    Handles: markdown fences, input as dict/list, thinking tags, etc."""
+    # Strip markdown code fences
+    text = re.sub(r'```(?:json|jsonl)?\s*\n?', '', raw)
+    text = re.sub(r'```\s*$', '', text, flags=re.MULTILINE)
+
+    # Strip <think>...</think> blocks (Gemini thinking)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
 
     pairs = []
-    for line in lines:
+
+    # Strategy 1: line-by-line JSONL parsing
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
         try:
             obj = json.loads(line)
-            if "instruction" not in obj or "output" not in obj:
-                continue
-
-            if output_format == "chat":
-                pairs.append({
-                    "messages": [
-                        {"role": "user", "content": obj["instruction"]},
-                        {"role": "assistant", "content": obj["output"]},
-                    ]
-                })
-            else:
-                pairs.append({
-                    "instruction": obj["instruction"],
-                    "input": obj.get("input", ""),
-                    "output": obj["output"],
-                })
+            pair = _normalize_pair(obj, output_format)
+            if pair:
+                pairs.append(pair)
         except json.JSONDecodeError:
             continue
 
+    # Strategy 2: if line-by-line failed, try finding JSON objects with regex
+    if not pairs:
+        for match in re.finditer(r'\{[^{}]*"instruction"[^{}]*\}', text, re.DOTALL):
+            try:
+                obj = json.loads(match.group())
+                pair = _normalize_pair(obj, output_format)
+                if pair:
+                    pairs.append(pair)
+            except json.JSONDecodeError:
+                continue
+
+    # Strategy 3: try parsing as a JSON array
+    if not pairs:
+        try:
+            arr_match = re.search(r'\[.*\]', text, re.DOTALL)
+            if arr_match:
+                arr = json.loads(arr_match.group())
+                for obj in arr:
+                    pair = _normalize_pair(obj, output_format)
+                    if pair:
+                        pairs.append(pair)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     return pairs
+
+
+def _normalize_pair(obj: dict, output_format: str) -> dict | None:
+    """Normalize a single training pair, converting non-string values."""
+    if not isinstance(obj, dict):
+        return None
+    if "instruction" not in obj or "output" not in obj:
+        return None
+
+    def to_str(val):
+        if isinstance(val, (dict, list)):
+            return json.dumps(val, ensure_ascii=False)
+        if not isinstance(val, str):
+            return str(val)
+        return val
+
+    instruction = to_str(obj["instruction"])
+    raw_input = to_str(obj.get("input", ""))
+    raw_output = to_str(obj["output"])
+
+    if output_format == "chat":
+        return {
+            "messages": [
+                {"role": "user", "content": instruction},
+                {"role": "assistant", "content": raw_output},
+            ]
+        }
+    return {
+        "instruction": instruction,
+        "input": raw_input,
+        "output": raw_output,
+    }
 
 
 # =============================================================================
@@ -340,9 +402,11 @@ Rules:
 - Use actual values from the rows in your instructions and outputs
 - Outputs must be detailed and analytical, not just restating the data
 - Match the language of the data (if data is in Arabic, pairs should be in Arabic)
-- Output ONLY valid JSONL (one JSON object per line), no markdown or explanation
+- Output ONLY valid JSONL (one JSON object per line)
+- No markdown, no code fences, no explanation before or after
+- CRITICAL: All values must be plain strings, NOT objects or arrays
 
-Each line must be: {{"instruction": "...", "input": "...", "output": "..."}}"""
+Each line must be exactly: {{"instruction": "a string", "input": "a string", "output": "a string"}}"""
 
 
 def parse_csv(csv_bytes: bytes) -> tuple[list[str], list[dict]]:
@@ -398,23 +462,28 @@ async def generate_pairs_csv_gemini(columns: list[str], row_batches: list[str],
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.7,
-                    "maxOutputTokens": 4096,
+                    "maxOutputTokens": 8192,
+                    "thinkingConfig": {"thinkingBudget": 0},
                 },
             }
 
             try:
-                resp = await client.post(
-                    f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}",
-                    json=payload,
-                )
+                url = f"{GEMINI_ENDPOINT}?key={GEMINI_API_KEY}"
+                resp = await client.post(url, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
+
+                if "error" in data:
+                    print(f"[gemini-csv] Batch {i+1}: API error: {data['error'].get('message','?')}")
+                    continue
 
                 text = data["candidates"][0]["content"]["parts"][0]["text"]
                 pairs = _parse_jsonl(text, output_format)
                 all_pairs.extend(pairs)
 
-                logger.info(f"CSV batch {i+1}/{len(row_batches)}: {len(pairs)} pairs")
+                print(f"[gemini-csv] Batch {i+1}/{len(row_batches)}: {len(pairs)} pairs (raw: {len(text)} chars)")
+                if len(pairs) == 0:
+                    print(f"[gemini-csv] RAW UNPARSED: {repr(text[:500])}")
 
                 if progress_callback:
                     await progress_callback(
@@ -424,7 +493,7 @@ async def generate_pairs_csv_gemini(columns: list[str], row_batches: list[str],
                     )
 
             except Exception as e:
-                logger.error(f"CSV batch {i+1}/{len(row_batches)} failed: {e}")
+                print(f"[gemini-csv] Batch {i+1}/{len(row_batches)} EXCEPTION: {type(e).__name__}: {e}")
 
             if i < len(row_batches) - 1:
                 await asyncio.sleep(0.5)

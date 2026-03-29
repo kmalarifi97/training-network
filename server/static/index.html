@@ -1071,7 +1071,7 @@
             }
 
             container.innerHTML = data.datasets.map(ds => {
-                const isActive = ds.status === 'PENDING' || ds.status === 'PROCESSING';
+                const isActive = ['PENDING', 'PROCESSING', 'EXTRACTING', 'GENERATING'].includes(ds.status);
                 const progress = ds.total_chunks > 0
                     ? Math.round((ds.processed_chunks / ds.total_chunks) * 100)
                     : 0;
